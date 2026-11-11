@@ -1,0 +1,2 @@
+pypdf==6.21.4
+markdown-it-py==4.3.0

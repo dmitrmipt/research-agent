@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Research Agent · Научная мастерская</title>
+  <link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script>
+</head>
+<body>
+  <aside class="sidebar">
+    <a href="#new" class="brand"><span class="mark">R<span>·</span></span><span>Research Agent<small>Научная мастерская</small></span></a>
+    <div class="nav-caption">РАБОЧЕЕ ПРОСТРАНСТВО</div>
+    <nav aria-label="Основная навигация">
+      <a href="#new" data-page="new"><span>＋</span>Новый разбор</a>
+      <a href="#jobs" data-page="jobs"><span>≡</span>Задания <b id="queue-count">0</b></a>
+      <div class="library-nav">
+        <div class="library-nav-row">
+          <a href="#library" data-page="library"><span>▤</span>Библиотека</a>
+          <button type="button" id="library-toggle" class="library-toggle" aria-expanded="false"
+            aria-controls="library-shortcuts" aria-label="Показать профили библиотеки"></button>
+        </div>
+        <div id="library-shortcuts" class="library-shortcuts" hidden></div>
+      </div>
+      <a href="#settings" data-page="settings"><span>⚙</span>Настройки</a>
+    </nav>
+    <div class="sidebar-bottom"><span class="local-dot"></span> Локальное приложение<p>Материалы и история хранятся<br>на этом компьютере.</p><span class="version" data-app-version hidden></span></div>
+  </aside>
+  <main>
+    <header class="topbar"><span>Личная исследовательская среда</span><span id="connection" role="status">Подключение…</span></header>
+    <div id="notice" role="status" hidden></div>
+
+    <section id="page-new" class="page">
+      <div class="page-heading"><div class="eyebrow">ПЕРВИЧНОЕ ЧТЕНИЕ</div><h1>Новый разбор</h1><p>Подготовьте профиль статьи с обзором, ключевыми утверждениями и близкими публикациями.</p></div>
+      <div class="new-grid"><form id="new-form" class="card">
+        <h2><span class="step-number">01</span> Материал для разбора</h2>
+        <div class="source-switch" role="group" aria-label="Тип материала"><button type="button" data-source="arxiv" class="selected" aria-pressed="true">Ссылка или ID arXiv</button><button type="button" data-source="pdf" aria-pressed="false">Загрузить PDF</button></div>
+        <div id="arxiv-input">
+          <label for="source">Статья на arXiv</label><input id="source" name="source" placeholder="Например, 2409.10975" maxlength="300">
+          <p class="hint">Можно указать ID или ссылку. При обработке будет скачана последняя опубликованная версия.</p>
+        </div>
+        <div id="pdf-input" hidden>
+          <label for="pdf">PDF с вашего компьютера</label><input id="pdf" type="file" accept="application/pdf,.pdf">
+          <p class="hint">До 15 МБ. Текст извлекается из текстового слоя PDF.</p>
+        </div>
+        <div class="form-divider"></div><h2><span class="step-number">02</span> Фокус внимания</h2>
+        <label for="questions">Что особенно важно проверить? <span class="optional">необязательно</span></label><textarea id="questions" rows="3" maxlength="12000" aria-describedby="questions-hint" placeholder="При каких условиях справедливы выводы?"></textarea>
+        <p id="questions-hint" class="hint">Для отдельных ответов пишите по одному вопросу со знаком «?» на строку или пронумеруйте вопросы. Остальной текст задаёт акценты обзора.</p>
+        <div class="field-row">
+          <div><label for="depth">Объём фрагментов для модели</label><select id="depth"><option value="brief">Меньше</option><option value="standard" selected>Стандартный</option><option value="deep">Больше</option></select></div>
+          <div><label for="mode">Режим</label><select id="mode"><option value="research">Подготовить профиль</option><option value="demo">Демонстрация</option></select></div>
+        </div>
+        <div id="demo-options" hidden><label for="scenario">Сценарий демонстрации</label><select id="scenario"><option value="success">Успешное завершение</option><option value="error">Ошибка на этапе поиска</option></select></div>
+        <p class="hint" id="processing-note">Фрагменты текста и ваши вопросы передаются в OpenAI, поисковые термины — в arXiv и Crossref. Вызовы модели могут расходовать средства API.</p>
+        <p class="hint" id="setup-state" role="status"></p>
+        <div class="form-footer"><span id="duration">Результат появится в библиотеке</span><button type="submit" class="primary" id="start-button">Подготовить профиль →</button></div>
+      </form>
+      <aside class="right-column">
+        <div class="card route-card">
+          <div class="eyebrow">ПУТЬ ЗАДАНИЯ</div><h2>Что делает приложение</h2>
+          <ol class="route">
+            <li><strong>Получает статью</strong><span>Последняя версия arXiv или ваш PDF</span></li>
+            <li><strong>Извлекает текст</strong><span>Фрагменты с привязкой к страницам</span></li>
+            <li><strong>Готовит обзор</strong><span>Ключевые слова, утверждения и подтверждающие фрагменты</span></li>
+            <li><strong>Подбирает аналоги</strong><span>Библиография и поиск публикаций</span></li>
+            <li><strong>Сохраняет профиль</strong><span>Одинаковые сведения в браузере и папке Materials</span></li>
+          </ol>
+        </div>
+        <div class="note-card"><strong>Можно закрыть вкладку</strong><p>Задание продолжится, пока сервер запущен. Вернитесь в «Задания», чтобы увидеть результат.</p></div>
+      </aside></div>
+    </section>
+
+    <section id="page-jobs" class="page" hidden><div class="page-heading"><div class="eyebrow">ХОД РАБОТЫ</div><h1>Задания</h1><p>Очередь обрабатывается последовательно. История сохраняется между запусками.</p></div><div class="stats"><div><strong id="stat-active">0</strong><span>В работе и очереди</span></div><div><strong id="stat-complete">0</strong><span>Завершено</span></div><div><strong id="stat-other">0</strong><span>Остановлено или с ошибкой</span></div></div><div id="library-filter" hidden><span></span><button type="button" id="clear-filter">Все задания</button></div><div class="jobs-grid"><div class="card job-list" id="job-list"></div><div class="card job-detail" id="job-detail"><div class="empty"><span>◎</span><h2>Выберите задание</h2><p>Здесь появятся этапы, настройки и результат.</p></div></div></div></section>
+
+    <section id="page-library" class="page" hidden>
+      <div class="page-heading"><div class="eyebrow">МАТЕРИАЛЫ И РЕЗУЛЬТАТЫ</div><h1>Библиотека</h1><p>Откройте строку статьи, чтобы посмотреть её профиль и файлы. Для arXiv хранится одна обработанная версия на публикацию.</p></div>
+      <div id="paper-list" class="library-rows"></div>
+    </section>
+
+    <section id="page-paper" class="page" hidden>
+      <div class="profile-back"><a href="#library">← К библиотеке</a></div>
+      <div id="paper-profile"></div>
+    </section>
+
+    <section id="page-settings" class="page" hidden>
+      <div class="page-heading"><div class="eyebrow">ПРАВИЛА РАБОТЫ</div><h1>Настройки</h1><p>Изменения применяются к новым заданиям. У каждого задания остаётся свой снимок настроек.</p></div>
+      <form id="settings-form" class="card settings-card">
+        <h2>Научный профиль</h2><p class="hint">Эти поля задают акценты для первичного чтения.</p>
+        <label for="interests">Темы интереса</label><textarea id="interests" rows="2" maxlength="12000" placeholder="Профиль пока не задан"></textarea>
+        <label for="exclusions">Исключения</label><textarea id="exclusions" rows="2" maxlength="12000" placeholder="Темы и типы работ, которые следует пропускать"></textarea>
+        <label for="rules">Правила чтения</label><textarea id="rules" rows="5" maxlength="12000"></textarea>
+        <label for="language">Язык обзора</label><select id="language"><option>Русский</option><option>English</option></select>
+        <div class="form-divider"></div><h2>Модель и ограничения</h2>
+        <label for="model">Идентификатор модели OpenAI</label><input id="model" maxlength="120" required placeholder="gpt-6-luna">
+        <div class="field-row">
+          <div><label for="max_api_calls">Максимум вызовов на задание</label><input id="max_api_calls" type="number" min="1" max="2" required></div>
+          <div><label for="max_output_tokens">Лимит выходных токенов на вызов</label><input id="max_output_tokens" type="number" min="1000" max="12000" required></div>
+        </div>
+        <p class="hint">Первый вызов готовит обзор. Второй сравнивает найденные публикации. При лимите в один вызов профиль сохраняется без списка аналогов.</p>
+        <div class="field-row">
+          <div><label for="time_limit_seconds">Лимит обработки, секунды</label><input id="time_limit_seconds" type="number" min="5" max="600" required></div>
+          <div><label for="stage_seconds">Длительность этапа демонстрации, секунды</label><input id="stage_seconds" type="number" min="1" max="10" required></div>
+        </div>
+        <p class="hint">Время отсчитывается с начала обработки. Остановка задания прекращает последующие запросы. Уже отправленный запрос может расходовать средства API.</p>
+        <div class="model-note"><strong>Доступ к OpenAI</strong><span id="key-state">Проверяем настройки сервера…</span></div>
+        <div class="form-footer"><span id="settings-state">Сохраняется на этом компьютере</span><button type="submit" class="primary">Сохранить настройки</button></div>
+      </form>
+    </section>
+    <footer>Research Agent <span class="mobile-version" data-app-version hidden></span><span>·</span> Отделяем утверждения от проверенных результатов</footer>
+  </main>
+</body>
+</html>

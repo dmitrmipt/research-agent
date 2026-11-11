@@ -1,0 +1,10 @@
+data/
+Materials/
+__pycache__/
+*.pyc
+.venv/
+*.log
+.test-data/
+.env
+.env.*
+!.env.example
