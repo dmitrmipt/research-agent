@@ -16,6 +16,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from manuscripts import SOURCE_LIMIT
+from model_catalog import validate_effort
 from materials import PDF_LIMIT, arxiv_id, clean_text, compact, web_link
 from version import VERSION
 
@@ -31,11 +32,12 @@ ARXIV_QUERY_INTERVAL = 3.05
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, message, status=None, *, retry_after=None, deferred=False):
+    def __init__(self, message, status=None, *, retry_after=None, deferred=False, code=""):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
         self.deferred = deferred
+        self.code = code
 
 
 def retry_delay(value):
@@ -78,15 +80,29 @@ class Http:
                     if len(result) > limit:
                         raise ServiceError(f"{service}: ответ превышает допустимый размер.")
         except HTTPError as exc:
+            error_code = ""
+            if service == "OpenAI":
+                try:
+                    detail = json.loads(exc.read(4096)).get("error")
+                    if isinstance(detail, dict) and detail.get("code") in {
+                            "insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
+                            "rate_limit_exceeded", "model_not_found", "invalid_api_key"}:
+                        error_code = detail["code"]
+                except (ValueError, UnicodeError, OSError, HTTPException, AttributeError):
+                    pass
             exc.close()
             self.checkpoint()
             if service == "OpenAI":
                 hint = {401: " Проверьте ключ API.", 403: " Проверьте права доступа.",
                         429: " Достигнут лимит запросов или средств."}.get(exc.code, "")
+                if error_code in {"insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached"}:
+                    hint = " Недостаточно средств или исчерпана квота API. Проверьте биллинг OpenAI перед повтором."
+                elif error_code == "rate_limit_exceeded":
+                    hint = " Превышена частота запросов. Повторите позже."
             else:
                 hint = " Сервис ограничил число запросов." if exc.code == 429 else ""
             delay = retry_delay(exc.headers.get("Retry-After")) if exc.headers and exc.code == 429 else None
-            raise ServiceError(f"{service}: HTTP {exc.code}.{hint}", status=exc.code, retry_after=delay) from None
+            raise ServiceError(f"{service}: HTTP {exc.code}.{hint}", status=exc.code, retry_after=delay, code=error_code) from None
         except (URLError, OSError, HTTPException):
             self.checkpoint()
             raise ServiceError(f"{service}: не удалось получить ответ. Проверьте сеть и повторите вручную.") from None
@@ -325,7 +341,8 @@ def array(items):
 PROFILE_SCHEMA = object_schema(
     summary=array(STRING),
     answers=array(object_schema(question_id=STRING, answer=STRING,
-                                status={"type": "string", "enum": ["answered", "insufficient"]})),
+                                status={"type": "string", "enum": ["answered", "insufficient"]},
+                                sources=array(object_schema(snippet=STRING, evidence=STRING)))),
     glossary=array(object_schema(term=STRING, explanation=STRING, role=STRING)),
     keywords=array(object_schema(term=STRING, importance={"type": "integer"}, role=STRING)),
     topics=array(STRING),
@@ -356,8 +373,10 @@ class Model:
             "max_output_tokens": self.settings["max_output_tokens"],
             "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
         }
-        if payload["model"] == "gpt-6-luna":
-            payload["reasoning"] = {"effort": "low"}
+        effort = self.settings.get("reasoning_effort", "auto")
+        validate_effort(payload["model"], effort)
+        if effort != "auto":
+            payload["reasoning"] = {"effort": effort}
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(raw) > MAX_PROMPT_BYTES:
             raise ServiceError("Запрос к модели превышает установленный предел входных данных.")
@@ -385,4 +404,22 @@ class Model:
             raise ServiceError("Модель вернула нечитаемые структурированные данные.") from None
         if not isinstance(value, dict):
             raise ServiceError("Модель вернула неожиданный формат профиля.")
+        validate_output(value, schema)
         return value
+
+
+def validate_output(value, schema):
+    """Validate the small schema subset used by both requests before consuming a result."""
+    expected = schema["type"]
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "integer": type(value) is int}.get(expected, False)
+    if not valid or "enum" in schema and value not in schema["enum"]:
+        raise ServiceError("Модель вернула данные, не соответствующие схеме результата.")
+    if expected == "object":
+        if set(value) != set(schema["properties"]):
+            raise ServiceError("Модель вернула неполный или неизвестный набор полей.")
+        for key, child in schema["properties"].items():
+            validate_output(value[key], child)
+    elif expected == "array":
+        for child in value:
+            validate_output(child, schema["items"])

@@ -10,11 +10,11 @@ from textwrap import wrap
 from urllib.parse import urlsplit
 
 from materials import (ARXIV_ID, AUTHOR_YEAR_START, PROFILE_VERSION, REFERENCE_AUTHOR, MaterialError, abstract_from_parts,
-                       arxiv_id, compact, document_text, ends_reference, excerpts, extract_pdf, full_author_names,
+                       arxiv_id, compact, document_text, ends_reference, extract_pdf, full_author_names,
                        split_sections, web_link)
 from publications import ANALOG_SCHEMA, DOI, PROFILE_SCHEMA, ServiceError, arxiv_url, doi, doi_url
+from retrieval import BUDGETS, select
 
-DEPTH_BYTES = {"brief": 16_000, "standard": 30_000, "deep": 48_000}
 BIBLIOGRAPHY_MISSING = "Библиографию не удалось выделить как отдельный раздел."
 ANALOGS_SKIPPED = "Подбор аналогов пропущен из-за лимита в один вызов API."
 LEGACY_SEARCH_NOTES = ("Поиск аналогов · ", "Библиография arXiv · ", "Ссылка arXiv ", "Библиография Crossref · ",
@@ -34,6 +34,8 @@ PROFILE_INSTRUCTIONS = """Составь карточку первичного �
 авторов и условия, при которых они получены. Приводи числа и неопределённости только из источника.
 В answers ответь кратко на каждый вопрос из questions по его question_id. Если данных мало, установи
 status insufficient и укажи, чего не хватает. Для вопроса с ответом используй status answered.
+Для каждого ответа в sources укажи snippet и короткую дословную цитату evidence из переданного текста.
+Если источника для ответа нет, sources оставь пустым. Не выдавай отсутствие данных в выборке за отсутствие в статье.
 В glossary выбери 7–10 важных для понимания работы терминов или меньше, если материал ограничен.
 Дай короткое объяснение простым общефизическим языком и укажи роль термина в этой статье.
 В keywords выбери 5–8 конкретных терминов, оцени их важность целым числом от 1 до 5 и дай роль термина.
@@ -120,13 +122,18 @@ def _focus_input(text):
     return "\n".join(focus), questions
 
 
-def _question_answers(questions, model_answers=()):
+def _question_answers(questions, model_answers=(), snippets=()):
     replies = {}
     for reply in model_answers:
         if answer := compact(reply["answer"], 1500):
-            replies.setdefault(reply["question_id"], {"answer": answer, "status": reply["status"]})
+            sources = [support for record in reply.get("sources", [])
+                       if (support := _support(record, snippets))]
+            status = reply["status"]
+            if status == "answered" and not sources:
+                status = "unverified"
+            replies.setdefault(reply["question_id"], {"answer": answer, "status": status, "sources": sources[:4]})
     return [{"question": question["text"], **replies.get(question["question_id"], {
-        "answer": "Ответ в этом разборе не сформирован.", "status": "missing"})} for question in questions]
+        "answer": "Ответ в этом разборе не сформирован.", "status": "missing", "sources": []})} for question in questions]
 
 
 def _profile_content(value, snippets, questions):
@@ -146,7 +153,7 @@ def _profile_content(value, snippets, questions):
             glossary.setdefault(term.casefold(), {"term": term, "explanation": explanation, "role": compact(definition["role"], 400)})
     return {"summary": [compact(paragraph, 2000) for paragraph in value["summary"][:2] if compact(paragraph)],
             "keywords": _keyword_weights(value["keywords"]), "topics": [compact(topic, 120) for topic in value["topics"][:4] if compact(topic)],
-            "claims": claims[:5], "answers": _question_answers(questions, value.get("answers", [])),
+            "claims": claims[:5], "answers": _question_answers(questions, value.get("answers", []), snippets),
             "glossary": list(glossary.values())[:10]}
 
 
@@ -248,7 +255,7 @@ def bibliography(parts, previous=()):
         arxiv_ids, dois = _reference_ids(text)
         entry.update(text=text, arxiv_ids=arxiv_ids, dois=dois)
         old = saved.get((entry["number"], entry["page"], text), {})
-        fields = ("arxiv_ids", "dois", "url", "title", "authors", "publisher_url", "publication", "year")
+        fields = ("arxiv_ids", "dois", "url", "title", "authors", "publisher_url", "publication", "year", "resolved_record")
         entry.update({key: old[key] for key in fields if old.get(key)})
         entry["url"] = reference_url(entry)
     locate_citations(entries, parts)
@@ -356,7 +363,7 @@ def _source_records(sources, label, action):
 def _bibliography_records(publications, http, ranked, sources, article_doi, known=(), linked_dois=()):
     records = []
     known_dois = {record["doi"] for record in known}
-    resolved = {identifier for entry in ranked if entry.get("publisher_url") for identifier in entry["dois"]}
+    resolved = {identifier for entry in ranked if entry.get("resolved_record") for identifier in entry["dois"]}
     doi_ids = dict.fromkeys([key for entry in ranked for key in entry["dois"]] + list(linked_dois))
     cited_dois = [key for key in doi_ids if key != article_doi and key not in known_dois | resolved][:2]
     for identifier in cited_dois:
@@ -388,6 +395,7 @@ def _enrich_references(references, records):
         published = by_id.get(dois[0]) if len(dois) == 1 else None
         if record := preprint or published:
             entry.update(title=record["title"], authors=", ".join(filter(None, record["authors"])), year=record["published"][:4])
+            entry["resolved_record"] = dict(record)
         if published and published.get("publisher_url"):
             entry["publisher_url"] = published["publisher_url"]
         if published and published.get("publication"):
@@ -409,6 +417,7 @@ def _candidates(publications, http, article, parts, links, terms, references, se
     by_crossref = attempt("Тематический поиск Crossref", lambda: publications.crossref_search(http, terms)) if terms else []
     cited = attempt("Библиография arXiv", lambda: publications.atom(
         http, id_list=",".join(cited_arxiv), max_results=len(cited_arxiv))) if cited_arxiv else []
+    cited.extend(entry["resolved_record"] for entry in references if entry.get("resolved_record"))
     resolved = {record["arxiv_id"] for record in cited + by_arxiv}
     for identifier in [key for key in cited_arxiv if key not in resolved][:5]:
         cited.extend(attempt(f"Страница arXiv {identifier}", lambda: publications.arxiv_page(http, identifier)))
@@ -502,17 +511,23 @@ def search_analogs(publications, http, model, content, article, parts, links, te
     return search
 
 
-def prepare_profile(job, publications, http, model, advance, resolve_version, get_pdf, current_profile, usage):
+def prepare_profile(job, publications, http, model, advance, resolve_version, get_pdf, current_profile, usage,
+                    *, cached=None, save_material=None):
     """Return a publishable bundle, or None when an arXiv refresh found the same version."""
     advance("Получение статьи", 5)
-    if job["kind"] == "arxiv":
+    if cached:
+        raw, article = cached["pdf"], dict(cached["article"])
+        if article.get("version"):
+            resolve_version(article["version"])
+    elif job["kind"] == "arxiv":
         base, _ = arxiv_id(job["source"])
         article = publications.latest(http, base)
         resolve_version(article["version"])
         saved_version = current_profile["article"]["version"] if current_profile else ""
         if saved_version and int(article["version"][1:]) < int(saved_version[1:]):
             raise ServiceError(f"arXiv сообщил {article['version']}, хотя уже сохранена {saved_version}. Обновление остановлено.")
-        if (job["scenario"] == "refresh" and current_profile and not current_profile.get("processing_error")
+        if (job["scenario"] == "refresh" and current_profile and current_profile["content"]["summary"]
+                and not current_profile.get("processing_error")
                 and article["version"] == saved_version):
             return None
         raw = publications.pdf(http, article)
@@ -522,8 +537,12 @@ def prepare_profile(job, publications, http, model, advance, resolve_version, ge
         filename = current_profile["article"]["filename"] if current_profile else job["title"]
         article = {"title": filename, "filename": filename, "authors": [], "source": "PDF",
                    "arxiv_id": "", "version": "", "doi": "", "published": "", "updated": "", "abstract": "", "url": ""}
+    if save_material and not cached:
+        save_material(raw, article, None)
     advance("Извлечение текста PDF", 25)
-    document = extract_pdf(raw, http.checkpoint)
+    document = cached.get("document") if cached else None
+    if document is None:
+        document = extract_pdf(raw, http.checkpoint)
     if job["kind"] == "pdf":
         article["title"] = document["metadata"].get("Title") or article["title"]
         author = document["metadata"].get("Author", "")
@@ -531,13 +550,17 @@ def prepare_profile(job, publications, http, model, advance, resolve_version, ge
         article["doi"] = doi(document["metadata"].get("DOI"))
     article["author_keywords"] = _author_keywords(document)
     article["sha256"] = hashlib.sha256(raw).hexdigest()
+    if save_material:
+        save_material(raw, article, document)
     parts = split_sections(document["pages"])
     source_abstract = article["abstract"]
     if not source_abstract:
         article["abstract"] = abstract_from_parts(parts)
     references = bibliography(parts)
     notes = list(document["notes"])
-    snippets, sampled = excerpts(parts, source_abstract, DEPTH_BYTES[job["depth"]])
+    focus, questions = _focus_input(job["questions"])
+    snippets, selection = select(parts, source_abstract, BUDGETS[job["depth"]], focus, questions)
+    sampled = selection["sampled"]
     has_text = any(snippet["page"] for snippet in snippets)
     basis = "Извлечённый текст PDF" if has_text else "Аннотация arXiv" if snippets else "Метаданные и PDF без читаемого текста"
     if not has_text:
@@ -551,7 +574,6 @@ def prepare_profile(job, publications, http, model, advance, resolve_version, ge
     if current_profile and not has_text and not snippets:
         raise MaterialError("В новом PDF не удалось извлечь текст. Предыдущий профиль сохранён.")
 
-    focus, questions = _focus_input(job["questions"])
     content = {"summary": [], "keywords": [], "topics": [], "claims": [], "analogs": [],
                "answers": _question_answers(questions), "glossary": [],
                "references": references, "resources": _resources(document, parts)}
@@ -571,7 +593,7 @@ def prepare_profile(job, publications, http, model, advance, resolve_version, ge
             if not parsed["summary"]:
                 raise ServiceError("Модель не вернула обзор по доступным материалам.")
         except ServiceError as error:
-            if current_profile:
+            if current_profile and current_profile["content"]["summary"]:
                 raise
             processing_error = str(error)
             notes.append(f"Подготовлен частичный профиль. Обзор не получен · {error}")
@@ -580,25 +602,15 @@ def prepare_profile(job, publications, http, model, advance, resolve_version, ge
             if not content["claims"]:
                 notes.append("Модель не вернула утверждений с дословным подтверждением из доступных фрагментов.")
             terms = _search_terms(result["search_terms"], article["title"])
-            if settings["max_api_calls"] > 1:
-                advance("Поиск и сравнение аналогов", 70)
-                search = search_analogs(publications, http, model, content, article, parts,
-                                       document["links"], terms, settings["language"])
-            else:
-                notes.append(ANALOGS_SKIPPED)
     else:
         notes.append("Подготовлен частичный профиль без вызова модели. Загрузите PDF с текстовым слоем для разбора.")
-
-    if search is None and references:
-        sources = []
-        records = _bibliography_records(publications, http, _ranked_references(references, parts, terms), sources, article["doi"])
-        _enrich_references(references, records)
-        notes.extend(f'{source["label"]} · {source["message"]}' for source in sources if "message" in source)
 
     profile = {"schema_version": PROFILE_VERSION, "job_id": job["id"], "prepared_at": datetime.now(timezone.utc).isoformat(),
                "article": article, "questions": job["questions"], "content": content, "search_terms": terms,
                "coverage": {"basis": basis, "read_pages": sum(bool(page) for page in document["pages"]),
                             "page_count": document["page_count"], "notes": notes,
-                            "sections": list(dict.fromkeys(part["section"] for part in parts))},
+                            "sections": list(dict.fromkeys(part["section"] for part in parts)), "selection": selection},
+               "analysis": {"settings": job["settings"], "depth": job["depth"], "snippets": snippets},
+               "result_status": "ready" if content["summary"] else "partial",
                "usage": usage(), "processing_error": processing_error, "analog_search": search}
     return raw, document_text(document), profile

@@ -45,9 +45,10 @@
         <label for="questions">Что особенно важно проверить? <span class="optional">необязательно</span></label><textarea id="questions" rows="3" maxlength="12000" aria-describedby="questions-hint" placeholder="При каких условиях справедливы выводы?"></textarea>
         <p id="questions-hint" class="hint">Для отдельных ответов пишите по одному вопросу со знаком «?» на строку или пронумеруйте вопросы. Остальной текст задаёт акценты обзора.</p>
         <div class="field-row">
-          <div><label for="depth">Объём фрагментов для модели</label><select id="depth"><option value="brief">Меньше</option><option value="standard" selected>Стандартный</option><option value="deep">Больше</option></select></div>
+          <div><label for="depth">Охват текста статьи</label><select id="depth"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option></select></div>
           <div><label for="mode">Режим</label><select id="mode"><option value="research">Подготовить профиль</option><option value="demo">Демонстрация</option></select></div>
         </div>
+        <p class="hint">Короткая статья передаётся целиком. Для длинной выбираются фрагменты до 2000 символов с перекрытием до 200: общий охват и материал по вашим вопросам. Усилие модели задаётся отдельно в настройках.</p>
         <div id="demo-options" hidden><label for="scenario">Сценарий демонстрации</label><select id="scenario"><option value="success">Успешное завершение</option><option value="error">Ошибка на этапе поиска</option></select></div>
         <p class="hint" id="processing-note">Фрагменты текста и ваши вопросы передаются в OpenAI, поисковые термины — в arXiv и Crossref. Вызовы модели могут расходовать средства API.</p>
         <p class="hint" id="setup-state" role="status"></p>
@@ -89,21 +90,50 @@
         <label for="rules">Правила чтения</label><textarea id="rules" rows="5" maxlength="12000"></textarea>
         <label for="language">Язык обзора</label><select id="language"><option>Русский</option><option>English</option></select>
         <div class="form-divider"></div><h2>Модель и ограничения</h2>
-        <label for="model">Идентификатор модели OpenAI</label><input id="model" maxlength="120" required placeholder="gpt-6-luna">
+        <div class="model-heading"><label id="model-label">Модель анализа</label><button type="button" id="models-refresh" class="secondary">Обновить список</button></div>
+        <input id="model" type="hidden" value="gpt-6-luna">
+        <div class="model-picker-wrap">
+          <button type="button" id="model-picker" class="model-picker" aria-haspopup="listbox" aria-expanded="false" aria-controls="model-options" aria-labelledby="model-label model-caption"><span id="model-caption">Загрузка каталога…</span><span aria-hidden="true">⌄</span></button>
+          <div id="model-popup" class="model-popup" hidden>
+            <input id="model-search" type="search" placeholder="Найти модель…" aria-label="Поиск модели" autocomplete="off">
+            <div id="model-options" role="listbox" aria-label="Модели анализа"></div>
+          </div>
+        </div>
+        <p id="catalog-state" class="hint" role="status"></p>
+        <div id="model-pricing" class="pricing-card"></div>
+        <label for="reasoning_effort">Усилие анализа</label><select id="reasoning_effort"><option value="auto">По умолчанию модели</option></select>
+        <p class="hint">Усилие управляет рассуждением модели. Высокие значения могут увеличить время и расход токенов. Охват текста задаётся отдельно для статьи.</p>
+        <details id="manual-model-details"><summary>Другой идентификатор модели</summary><label for="manual-model">Идентификатор</label><input id="manual-model" maxlength="120" placeholder="Введите модель"><button type="button" id="manual-model-apply" class="secondary">Выбрать</button><p class="hint">Для неизвестных моделей цена и совместимость не подтверждены; усилие — по умолчанию.</p><p id="other-models" class="hint"></p></details>
         <div class="field-row">
           <div><label for="max_api_calls">Максимум вызовов на задание</label><input id="max_api_calls" type="number" min="1" max="2" required></div>
           <div><label for="max_output_tokens">Лимит выходных токенов на вызов</label><input id="max_output_tokens" type="number" min="1000" max="12000" required></div>
         </div>
-        <p class="hint">Первый вызов готовит обзор. Второй сравнивает найденные публикации. При лимите в один вызов профиль сохраняется без списка аналогов.</p>
+        <p class="hint">При первичном разборе первый вызов готовит обзор, второй сравнивает публикации. При продолжении лимит относится к недостающим этапам нового задания.</p>
         <div class="field-row">
           <div><label for="time_limit_seconds">Лимит обработки, секунды</label><input id="time_limit_seconds" type="number" min="5" max="600" required></div>
           <div><label for="stage_seconds">Длительность этапа демонстрации, секунды</label><input id="stage_seconds" type="number" min="1" max="10" required></div>
         </div>
         <p class="hint">Время отсчитывается с начала обработки. Остановка задания прекращает последующие запросы. Уже отправленный запрос может расходовать средства API.</p>
         <div class="model-note"><strong>Доступ к OpenAI</strong><span id="key-state">Проверяем настройки сервера…</span></div>
+        <p class="hint">Цены справочные для Standard. Подписка и баланс по проектному ключу не определяются. <a href="https://platform.openai.com/settings/organization/billing/overview" target="_blank" rel="noopener noreferrer">Открыть биллинг OpenAI ↗</a></p>
         <div class="form-footer"><span id="settings-state">Сохраняется на этом компьютере</span><button type="submit" class="primary">Сохранить настройки</button></div>
       </form>
     </section>
+    <dialog id="analysis-dialog" aria-labelledby="analysis-title">
+      <form id="analysis-form">
+        <div class="detail-heading"><h2 id="analysis-title">Разобрать заново</h2><button type="button" id="analysis-close" class="secondary" aria-label="Закрыть параметры">Закрыть</button></div>
+        <p id="analysis-description" class="hint"></p>
+        <label for="analysis-preset">Начальные настройки</label><select id="analysis-preset"><option value="previous">Из предыдущего разбора</option><option value="current">Текущие общие настройки</option></select>
+        <div id="analysis-questions-wrap"><label for="analysis-questions">Вопросы и фокус</label><textarea id="analysis-questions" rows="4" maxlength="12000"></textarea>
+          <label for="analysis-depth">Охват текста</label><select id="analysis-depth"><option value="brief">16 000 символов</option><option value="standard">30 000 символов</option><option value="deep">48 000 символов</option></select></div>
+        <label for="analysis-model">Модель</label><input id="analysis-model" list="analysis-models" maxlength="120" required><datalist id="analysis-models"></datalist>
+        <label for="analysis-effort">Усилие анализа</label><select id="analysis-effort"></select>
+        <div class="field-row"><div><label for="analysis-calls">Максимум вызовов</label><input id="analysis-calls" type="number" min="1" max="2" required></div><div><label for="analysis-time">Лимит времени, с</label><input id="analysis-time" type="number" min="5" max="600" required></div></div>
+        <label for="analysis-output">Лимит выходных токенов на вызов</label><input id="analysis-output" type="number" min="1000" max="12000" required>
+        <p id="analysis-error" class="error-box" role="alert" hidden></p>
+        <div class="form-footer"><span>Параметры сохранятся в новом задании.</span><button type="submit" id="analysis-submit" class="primary">Начать разбор</button></div>
+      </form>
+    </dialog>
     <footer>Research Agent <span class="mobile-version" data-app-version hidden></span><span>·</span> Отделяем утверждения от проверенных результатов</footer>
   </main>
 </body>

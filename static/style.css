@@ -430,3 +430,34 @@
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+/* Analysis stages and model selection. */
+.result-state { padding: 12px 15px; border-radius: 8px; background: var(--accent-light); font-size: 13px; }
+.result-state.partial { background: var(--warm-tint); color: var(--warm-ink); }
+.step-list { list-style: none; margin: 16px 0; padding: 0; }
+.step-list li { display: grid; grid-template-columns: 1fr auto; gap: 4px 12px; padding: 10px 0; border-bottom: 1px solid var(--line); font-size: 12px; }
+.step-list p { grid-column: 1 / -1; margin: 0; color: var(--muted); }
+.step-state-completed > span { color: var(--accent); }
+.step-state-failed > span, .step-state-blocked > span { color: var(--red); }
+.step-state-skipped > span { color: var(--warm-ink); }
+.model-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 12px; }
+.model-heading label { margin: 0; }
+.model-picker-wrap { position: relative; margin-top: 10px; }
+.model-picker { width: 100%; display: flex; justify-content: space-between; align-items: center; border: 1px solid var(--warm-border); border-radius: 8px; padding: 16px; background: var(--warm-tint); color: var(--ink); text-align: left; font-weight: 600; }
+.model-popup { position: absolute; inset: calc(100% + 6px) 0 auto; z-index: 10; background: white; padding: 10px; border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 32px #172e2520; }
+#model-options { max-height: 320px; overflow: auto; margin-top: 8px; }
+.model-option { display: grid; gap: 3px; padding: 12px; width: 100%; border: 1px solid transparent; border-radius: 7px; background: white; color: var(--ink); text-align: left; }
+.model-option:hover, .model-option[aria-selected=true] { background: var(--accent-light); border-color: var(--line); }
+.model-option span, .model-option small { font-size: 11px; color: var(--muted); }
+.model-option:disabled { cursor: default; }
+.pricing-card { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-top: 14px; padding: 16px; background: #f7f9f5; border: 1px solid var(--line); border-radius: 8px; }
+.pricing-card span, .pricing-card strong { display: block; }
+.pricing-card span { color: var(--muted); font-size: 11px; }
+.pricing-card strong { margin-top: 3px; font-size: 20px; font-weight: 600; }
+.pricing-card p { grid-column: 1 / -1; margin: 0; }
+#manual-model-apply { margin-top: 10px; }
+#other-models { overflow-wrap: anywhere; }
+dialog { width: min(640px, calc(100% - 24px)); max-height: calc(100% - 32px); overflow: auto; border: 1px solid var(--line); border-radius: 14px; padding: 26px; color: var(--ink); }
+dialog::backdrop { background: #172e2570; }
+dialog .detail-heading h2 { font-size: 21px; }
+@media (max-width: 700px) { .pricing-card { gap: 8px; padding: 12px; } .pricing-card strong { font-size: 17px; } dialog { padding: 18px; } }

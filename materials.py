@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from html import escape
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -19,8 +20,9 @@ from version import VERSION
 PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
-MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", *SOURCE_FILES)
-PROFILE_VERSION = 5
+MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
+PROFILE_VERSION = 6
+EXTRACTION_VERSION = 1
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
 REFERENCE_SIGNAL = re.compile(r"\b(?:18|19|20)\d{2}\b|arxiv\s*:|10\.\d{4,9}/", re.I)
@@ -56,6 +58,13 @@ SECTION_NAMES = {
     "supplementary material": "Приложение", "data availability": "Данные",
     "code availability": "Код",
 }
+
+
+def extraction_signature():
+    try:
+        return f"{EXTRACTION_VERSION}/pypdf/{package_version('pypdf')}"
+    except PackageNotFoundError:
+        return f"{EXTRACTION_VERSION}/pypdf/unavailable"
 
 
 class MaterialError(RuntimeError):
@@ -281,26 +290,6 @@ def abstract_from_parts(parts):
     return ""
 
 
-def excerpts(parts, abstract, budget):
-    snippets = []
-    for part in parts:
-        if part["section"] in {"Библиография", "Благодарности"}:
-            continue
-        text = compact(part["text"])
-        for offset in range(0, len(text), 2000):
-            snippets.append({"id": f"s{len(snippets) + 1}", "page": part["page"],
-                             "section": part["section"], "text": text[offset:offset + 2000]})
-    capacity = max(1, budget // 2000)
-    sampled = len(snippets) > capacity
-    if sampled:
-        indices = [round(i * (len(snippets) - 1) / max(1, capacity - 1)) for i in range(capacity)]
-        snippets = [snippets[i] for i in indices]
-    if abstract:
-        snippets.insert(0, {"id": "abstract", "page": None, "section": "Аннотация arXiv",
-                            "text": compact(abstract, 4000)})
-    return snippets, sampled
-
-
 def document_text(document):
     return "\n\n".join(f"--- Страница {number} ---\n{text or '[Текст не извлечён]'}"
                        for number, text in enumerate(document["pages"], start=1)) + "\n"
@@ -388,7 +377,7 @@ class MaterialLibrary:
             self._discard(cleanup)
         self._discard(prepare)
 
-    def publish(self, source, pdf, text, profile, manuscript=None):
+    def publish(self, source, pdf, text, profile, manuscript=None, document=None):
         """Publish the current files or restore the previous profile after failure."""
         folder = self.folder(source)
         folder.mkdir(exist_ok=True)
@@ -404,6 +393,14 @@ class MaterialLibrary:
             (new / "text.txt").write_text(text, encoding="utf-8")
             (new / "profile.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             (new / "profile.md").write_text(render_markdown(profile), encoding="utf-8")
+            if document is not None:
+                cache = {"version": EXTRACTION_VERSION, "parser": extraction_signature(),
+                         "sha256": profile["article"]["sha256"], "document": document}
+                (new / "document.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            elif previous and previous["article"].get("sha256") == profile["article"].get("sha256"):
+                saved_cache = self._direct(folder / "document.json")
+                if saved_cache.is_file():
+                    shutil.copyfile(saved_cache, new / "document.json")
             filename = profile["article"].get("manuscript", {}).get("file")
             if filename in SOURCE_FILES:
                 (new / filename).write_bytes(self.read(source, filename) if manuscript is None else manuscript)
@@ -416,7 +413,7 @@ class MaterialLibrary:
                 staged = rollback / "new" / name
                 if staged.is_file():
                     staged.replace(folder / name)
-                elif name == old_manuscript and (rollback / "old" / name).is_file():
+                elif (name == old_manuscript or name == "document.json") and (rollback / "old" / name).is_file():
                     (folder / name).unlink(missing_ok=True)
             self._rename_directory(rollback, cleanup)
         except OSError:
@@ -532,6 +529,21 @@ def profile_sections(profile):
                       item("Страницы с текстом", f'{coverage["read_pages"]} из {coverage["page_count"] if coverage["page_count"] is not None else "неизвестного числа"}'),
                       item("Фокус внимания", profile["questions"] or "Не указан"),
                       item("API", f'{usage["model"] or "Модель не вызывалась"} · запросов: {usage["calls"]} · вход: {usage["input_tokens"]} · выход: {usage["output_tokens"]} токенов')]
+    selection = coverage.get("selection")
+    if selection:
+        coverage_items.append(item("Передано модели", f'{selection["selected_fragments"]} из {selection["available_fragments"]} фрагментов; '
+                                   f'{selection["selected_chars"]} из {selection["available_chars"]} символов. '
+                                   f'Бюджет: {selection["budget_chars"]}.'))
+        coverage_items.append(item("Страницы, переданные модели", ", ".join(map(str, selection["pages"])) or "Только аннотация"))
+        coverage_items.append(item("Отбор текста", "Общий охват и фрагменты по вопросам (локальный поиск по терминам)."
+                                   if selection["question_focused"] else "Общий охват разделов статьи."))
+    for key, step in profile.get("steps", {}).items():
+        labels = {"material": "Материалы", "core": "Основной профиль", "references": "Библиография",
+                  "analogs": "Аналоги", "manuscript": "Исходник"}
+        statuses = {"pending": "Ожидает", "running": "Выполняется", "completed": "Готово", "skipped": "Пропущено",
+                    "failed": "Ошибка", "blocked": "Требуется действие", "not_applicable": "Не требуется"}
+        coverage_items.append(item(labels.get(key, key), statuses.get(step["status"], step["status"]) +
+                                   (" · " + step["message"] if step.get("message") else "")))
     if coverage["sections"]:
         coverage_items.append(item("Распознанные разделы", ", ".join(coverage["sections"])))
     if usage["reported_calls"] < usage["calls"]:
@@ -548,8 +560,15 @@ def profile_sections(profile):
     summary = content["summary"]
     if profile["schema_version"] < 5 and summary:
         summary = [" ".join(summary)]
-    answers = [item(reply["question"], ("Недостаточно данных. " if reply["status"] == "insufficient" else "") + reply["answer"])
-               for reply in content.get("answers", [])]
+    answers = []
+    for reply in content.get("answers", []):
+        prefix = {"insufficient": "Недостаточно данных в выбранных фрагментах. ",
+                  "unverified": "Подтверждение источником не сохранено или не найдено. ", "missing": ""}.get(reply["status"], "")
+        answer = item(reply["question"], prefix + reply["answer"])
+        answer["details"] = [item("Ответ", answer["text"])] + [
+            {**item("Источник", f'«{source["evidence"]}»'), "location": source["location"], "page": source.get("page")}
+            for source in reply.get("sources", [])]
+        answers.append(answer)
     glossary = [item(definition["term"], "\n".join(filter(None, (definition["explanation"], definition["role"]))))
                 for definition in content.get("glossary", [])]
     subsections = [{"key": key, "title": title, "items": items} for key, title, items in (
@@ -635,7 +654,7 @@ def _markdown_item(key, item):
                                   for place in item["citations"])
             lines.append("  В тексте · " + mentions)
         return [line + "  " for line in lines[:-1]] + lines[-1:]
-    if key in {"analogs", "claims"}:
+    if item.get("details"):
         lines = ["- **" + label + "**"]
         if item.get("byline"):
             lines.append("  " + _markdown_text(item["byline"]))

@@ -26,6 +26,7 @@ from manuscripts import select_manuscript
 from materials import MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _reference_item, document_text, split_sections
 from publications import Http, Publications, ServiceError
 from research import BIBLIOGRAPHY_MISSING, _candidate_snippets, bibliography, reference_url
+from pipeline import Pipeline, StepExpired
 
 ROOT = Path(__file__).resolve().parents[1]
 FOCAL = "2409.10975"
@@ -124,6 +125,7 @@ class ResearchTest(TempTest):
         self.fail_atom = False
         self.arxiv_pages = []
         self.fail_model = False
+        self.fail_catalog = False
         self.empty_analogs = False
         self.model_arrived = threading.Event()
         self.resume_model = threading.Event()
@@ -205,6 +207,10 @@ class ResearchTest(TempTest):
                 return json.dumps({"message": {"items": [journal, citation("10.1234/no-text", "Metadata only", "")]}}).encode()
             return json.dumps({"message": citation("10.1234/older", "Cited apparatus", "The authors report a microwave calibration.")}).encode()
         if parts.hostname == "api.openai.com":
+            if parts.path == "/v1/models":
+                if self.fail_catalog:
+                    raise ServiceError("OpenAI: HTTP 401.", status=401)
+                return json.dumps({"data": [{"id": "gpt-6-luna"}, {"id": "text-embedding-3-small"}]}).encode()
             self.assertEqual(parts.path, "/v1/responses")
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fixture-key")
             request = json.loads(kwargs["data"])
@@ -221,7 +227,8 @@ class ResearchTest(TempTest):
                 claim = {"statement": "Измерена разница 4 дБ.", "kind": "measurement", "snippet": snippet["id"],
                          "evidence": QUOTE, "locator": "Несуществующий рисунок 9", "check": "Проверить калибровку.",
                          "explanation": "Разница относится к измеренным спектрам. Температура образца составила 20 мК."}
-                answers = [{"question_id": question["question_id"], "answer": reply, "status": status}
+                answers = [{"question_id": question["question_id"], "answer": reply, "status": status,
+                            "sources": [{"snippet": snippet["id"], "evidence": QUOTE}] if status == "answered" else []}
                            for question, (reply, status) in zip(inputs["questions"], (
                                ("Измерена разница 4 дБ.", "answered"), ("Не указан предел шума.", "insufficient"),
                            ))]
@@ -293,12 +300,13 @@ class ResearchTest(TempTest):
         initial_files = {name: (folder / name).read_bytes() for name in names}
         self.assertEqual(initial_files["manuscript.tex"], TEX + b"v3")
         self.assertEqual(self.call(path + "/manuscript.tex", raw=True), TEX + b"v3")
-        source = self.call(path + "/manuscript.html?snapshot=" + job["id"], raw=True).decode()
+        revision = initial["profile"]["revision"]
+        source = self.call(path + "/manuscript.html?snapshot=" + revision, raw=True).decode()
         self.assertIn('<span class="tex-command">\\documentclass</span>', source)
         self.assertIn('<span class="tex-math">$</span>', source)
         self.assertIn("&lt;script&gt;fixture&lt;/script&gt;", source)
         self.assertNotIn("<script>", source)
-        self.assertIn(f'manuscript.tex?snapshot={job["id"]}', source)
+        self.assertIn(f'manuscript.tex?snapshot={revision}', source)
         (folder / "notes.txt").write_text("Reader notes", encoding="utf-8")
 
         same = self.settled(self.call(path + "/refresh", {}))
@@ -390,7 +398,7 @@ class ResearchTest(TempTest):
         overview = next(section for section in paper["sections"] if section["key"] == "overview")
         self.assertEqual(len(overview["paragraphs"]), 2)
         self.assertEqual([sub["key"] for sub in overview["subsections"]], ["answers", "glossary"])
-        self.assertTrue(overview["subsections"][0]["items"][1]["text"].startswith("Недостаточно данных."))
+        self.assertTrue(overview["subsections"][0]["items"][1]["text"].startswith("Недостаточно данных в выбранных фрагментах."))
         self.assertEqual(content["resources"][0]["kind"], "Код")
         self.assertIn(MOLLOW, self.crossref_queries)
         self.assertEqual([entry["number"] for entry in content["references"]], ["1", "2", "3"])
@@ -427,12 +435,13 @@ class ResearchTest(TempTest):
         self.assertIn("### Ответы на вопросы", markdown.decode())
         self.assertIn("### Словарь терминов", markdown.decode())
         self.assertIn("(article.pdf#page=1)", markdown.decode())
-        preview_path = path + "/profile.html?snapshot=" + job["id"]
+        revision = profile["revision"]
+        preview_path = path + "/profile.html?snapshot=" + revision
         preview = self.call(preview_path, raw=True).decode()
         self.assertIn("<h1>Uploaded paper</h1>", preview)
         self.assertIn("B. R. Mollow<br>", preview)
         self.assertNotIn("<strong>B. R. Mollow</strong>", preview)
-        self.assertIn(f'href="article.pdf?snapshot={job["id"]}#page=1"', preview)
+        self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', preview)
         self.assertIn(f'href="https://arxiv.org/pdf/{NEIGHBOR}v2#page=1"', preview)
 
         with (folder / "profile.md").open("a", encoding="utf-8") as saved:
@@ -458,7 +467,7 @@ class ResearchTest(TempTest):
         self.assertEqual(profile["content"]["analogs"], [])
         self.assertEqual(len(profile["content"]["references"]), 3)
         self.assertEqual(profile["content"]["references"][2]["url"], PUBLISHER)
-        self.assertTrue(any("лимита" in note for note in profile["coverage"]["notes"]))
+        self.assertEqual(profile["steps"]["analogs"]["code"], "call_limit")
 
     def test_blank_pdf_saves_partial_profile_without_calling_model(self):
         job = self.uploaded(pdf_bytes("Image-only fixture", blank=True))
@@ -542,6 +551,179 @@ class ResearchTest(TempTest):
         self.assertIsNone(self.call("/api/papers/" + job["paper_id"])["profile"])
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.crossref_queries, [])
+
+    def test_timeout_after_core_preserves_profile_and_continuation_skips_core(self):
+        def expire(pipeline):
+            pipeline.deadline = 0
+            pipeline.optional_checkpoint()
+
+        with patch.object(Pipeline, "analogs", expire):
+            first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+            result = self.settled(first)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result_status"], "ready")
+        self.assertEqual(result["steps"]["analogs"]["code"], "time_limit")
+        self.assertTrue(result["retry"]["allowed"])
+        path = "/api/papers/" + first["paper_id"]
+        saved = self.call(path)["profile"]
+        self.assertTrue(saved["content"]["summary"])
+        self.assertEqual(len(self.requests), 1)
+        resumed = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(resumed["status"], "completed", resumed["error"])
+        self.assertEqual(resumed["parent_job_id"], first["id"])
+        self.assertEqual(resumed["api_usage"]["calls"], 1)
+        self.assertEqual(self.resolutions, [FOCAL])
+        self.assertEqual(self.downloads.count(f"/pdf/{FOCAL}v3"), 1)
+        final = self.call(path)["profile"]
+        self.assertEqual(final["content"]["summary"], saved["content"]["summary"])
+        self.assertNotEqual(final["revision"], saved["revision"])
+        with self.assertRaises(HTTPError) as stale:
+            self.call(path + "/article.pdf?snapshot=" + saved["revision"], raw=True)
+        self.assertEqual(stale.exception.code, 409)
+
+    def test_core_visible_before_optional_work_and_cancel_keeps_it(self):
+        arrived, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def wait(pipeline):
+            arrived.set()
+            release.wait(6)
+            pipeline.alive()
+
+        with patch.object(Pipeline, "analogs", wait):
+            first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+            self.assertTrue(arrived.wait(6))
+            path = "/api/papers/" + first["paper_id"]
+            core = self.call(path)["profile"]
+            self.assertTrue(core["content"]["summary"])
+            self.call("/api/jobs/" + first["id"] + "/cancel", {})
+            release.set()
+            time.sleep(.1)
+        stopped = self.call("/api/jobs/" + first["id"])
+        self.assertEqual(stopped["status"], "cancelled")
+        self.assertTrue(stopped["retry"]["allowed"])
+        self.assertEqual(self.call(path)["profile"]["revision"], core["revision"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.source_downloads, [])
+
+    def test_reanalysis_reuses_pdf_and_document_with_isolated_settings(self):
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        original = self.call(path)["profile"]
+        downloads, resolutions = list(self.downloads), list(self.resolutions)
+        with patch("research.extract_pdf", side_effect=AssertionError("must use extraction cache")), \
+                patch("pipeline.extract_pdf", side_effect=AssertionError("must use extraction cache")):
+            repeated = self.settled(self.call(path + "/reanalyze", {"questions": "Что измерено?", "depth": "deep",
+                "settings": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "max_api_calls": 1}}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(repeated["operation"], "reanalyze")
+        self.assertEqual(repeated["api_usage"]["calls"], 1)
+        self.assertEqual(self.downloads, downloads)
+        self.assertEqual(self.resolutions, resolutions)
+        self.assertEqual(self.requests[-1]["reasoning"], {"effort": "high"})
+        self.assertEqual(self.call("/api/settings")["model"], "gpt-6-luna")
+        final = self.call(path)["profile"]
+        self.assertNotEqual(final["revision"], original["revision"])
+        self.assertEqual(final["article"]["sha256"], original["article"]["sha256"])
+        self.assertEqual(final["content"]["answers"][0]["sources"][0]["evidence"], QUOTE)
+        self.assertEqual(final["coverage"]["selection"]["budget_chars"], 48000)
+
+    def test_failed_reanalysis_keeps_old_profile_and_retry_repeats_model(self):
+        first = self.uploaded(pdf_bytes("Stable profile"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        before = self.call(path)["profile"]
+        self.fail_model = True
+        failed = self.settled(self.call(path + "/reanalyze", {"questions": "Что измерено?"}))
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(self.call(path)["profile"], before)
+        self.fail_model = False
+        count = len(self.requests)
+        repeated = self.settled(self.call("/api/jobs/" + failed["id"] + "/retry", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(self.requests[count]["text"]["format"]["name"], "article_profile")
+        self.assertEqual(self.call(path)["profile"]["questions"], "Что измерено?")
+
+    def test_retry_first_failure_uses_downloaded_materials_and_blank_is_blocked(self):
+        self.fail_model = True
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "failed")
+        before = list(self.downloads)
+        self.fail_model = False
+        repeated = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(self.downloads[:len(before)], before)
+        self.assertEqual(self.downloads.count(f"/pdf/{FOCAL}v3"), 1)
+        blank = self.settled(self.uploaded(pdf_bytes("No text", blank=True)))
+        self.assertEqual(blank["result_status"], "partial")
+        self.assertFalse(blank["retry"]["allowed"])
+        with self.assertRaises(HTTPError) as denied:
+            self.call("/api/jobs/" + blank["id"] + "/retry", {})
+        self.assertEqual(denied.exception.code, 400)
+
+    def test_catalog_and_effort_validation_do_not_call_inference(self):
+        catalog = self.call("/api/models/refresh", {})
+        known = {item["id"]: item for item in catalog["models"]}
+        self.assertTrue(known["gpt-6-luna"]["available"])
+        self.assertFalse(known["gpt-6-astra"]["available"])
+        self.assertIn("text-embedding-3-small", catalog["other_models"])
+        self.assertEqual(self.requests, [])
+        with self.assertRaises(HTTPError) as invalid:
+            self.call("/api/settings", {"model": "gpt-6-astra", "reasoning_effort": "none"})
+        self.assertEqual(invalid.exception.code, 400)
+        self.call("/api/settings", {"model": "custom-model", "reasoning_effort": "auto"})
+        self.fail_catalog = True
+        self.server.worker.catalog.last_attempt = 0
+        failed = self.call("/api/models/refresh", {})
+        self.assertIsNotNone(failed["error"])
+        self.assertFalse(failed["availability_checked"])
+        self.assertEqual(self.requests, [])
+
+    def test_stale_extraction_cache_is_rebuilt_and_tampered_pdf_is_rejected(self):
+        first = self.uploaded(pdf_bytes("Cache fixture"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        folder = Path(self.call(path)["directory"])
+        cache = json.loads((folder / "document.json").read_text(encoding="utf-8"))
+        cache["parser"] = "old-parser"
+        (folder / "document.json").write_text(json.dumps(cache), encoding="utf-8")
+        from research import extract_pdf
+        with patch("research.extract_pdf", wraps=extract_pdf) as extractor:
+            repeated = self.settled(self.call(path + "/reanalyze", {"settings": {"max_api_calls": 1}}))
+            self.assertEqual(repeated["status"], "completed", repeated["error"])
+            self.assertEqual(extractor.call_count, 1)
+        (folder / "article.pdf").write_bytes(pdf_bytes("Changed content"))
+        with self.assertRaises(HTTPError) as tampered:
+            self.call(path + "/reanalyze", {})
+        self.assertEqual(tampered.exception.code, 400)
+
+    def test_same_version_refresh_keeps_continuation_of_missing_analogs(self):
+        self.call("/api/settings", {"max_api_calls": 1})
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        refreshed = self.settled(self.call(path + "/refresh", {}))
+        self.assertEqual(refreshed["api_usage"]["calls"], 0)
+        paper = self.call(path)
+        self.assertEqual(paper["continuation_job"]["id"], first["id"])
+        resumed = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(resumed["api_usage"]["calls"], 1)
+        self.assertFalse(resumed["retry"]["allowed"])
+
+    def test_cancelled_queued_reanalysis_can_be_continued(self):
+        first = self.uploaded(pdf_bytes("Queued continuation"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        self.server.worker.stop.set()
+        self.server.worker.thread.join(5)
+        path = "/api/papers/" + first["paper_id"]
+        queued = self.call(path + "/reanalyze", {})
+        self.assertEqual(queued["status"], "queued")
+        stopped = self.call("/api/jobs/" + queued["id"] + "/cancel", {})
+        self.assertTrue(stopped["retry"]["allowed"])
+        resumed = self.call("/api/jobs/" + queued["id"] + "/retry", {})
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["input_revision"], queued["input_revision"])
 
 
 class StorageTest(TempTest):
