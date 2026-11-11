@@ -2,6 +2,7 @@ import base64
 import json
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -114,6 +115,20 @@ class AppTest(unittest.TestCase):
         time.sleep(.3)
         self.assertFalse(any(j['status'] in ('queued', 'running') for j in self.call('/api/jobs')))
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux TCP port reuse')
+    def test_restart_on_same_port_after_ctrl_c(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as client:
+            request = f'GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{self.port}\r\n\r\n'
+            client.sendall(request.encode('ascii'))
+            # Wait for the server to close first so the listening port has a TIME_WAIT connection.
+            with client.makefile('rb') as response:
+                self.assertTrue(response.read().startswith(b'HTTP/1.0 200'))
+        self.process.send_signal(signal.SIGINT)
+        self.assertEqual(self.process.wait(timeout=5), 0)
+        self.kill()
+        self.start()
+        self.assertTrue(self.call('/api/health')['worker_alive'])
+
     def test_failure_and_time_limit(self):
         self.settings(stage_seconds=1)
         job = self.create(scenario='error')
@@ -151,6 +166,7 @@ class AppTest(unittest.TestCase):
         self.wait_status(job['id'], ['running'])
         process = subprocess.run([sys.executable, str(ROOT / 'app.py'), '--port', str(self.port), '--data-dir', str(self.temp)], capture_output=True, timeout=4)
         self.assertNotEqual(process.returncode, 0)
+        self.assertIn(f'Port {self.port} is unavailable.', process.stderr.decode())
         self.assertEqual(self.call('/api/jobs/' + job['id'])['status'], 'running')
 
 

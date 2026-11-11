@@ -726,7 +726,9 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class LocalServer(ThreadingHTTPServer):
-    allow_reuse_address = False
+    # Unix can reopen a listener while its closed connections are in TIME_WAIT.
+    allow_reuse_address = os.name == "posix"
+    allow_reuse_port = False
     block_on_close = True
     daemon_threads = False
 

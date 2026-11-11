@@ -431,7 +431,9 @@ document.querySelector('nav a[data-page="jobs"]').addEventListener("click", show
 async function refresh(){
   if(busy)return;busy=true;
   try{
-    jobs=await api("/api/jobs");$("connection").textContent="● Сервер доступен";$("connection").className="online";
+    jobs=await api("/api/jobs");
+    if (!health || currentPage === "settings") await loadHealth();
+    $("connection").textContent="● Сервер доступен";$("connection").className="online";
     $("queue-count").textContent=jobs.filter(job=>["queued","running"].includes(job.status)).length;
     if(currentPage==="jobs"){renderJobs();await renderDetail();}
     if(currentPage==="paper")await renderProfile();
@@ -440,10 +442,14 @@ async function refresh(){
       if (currentPage === "library") renderPapers(papers);
       if (!$("library-shortcuts").hidden) renderLibraryShortcuts(papers);
     }
-  }catch(error){$("connection").textContent="● Нет связи с сервером";$("connection").className="offline";}
+  }catch(error){
+    health = null;
+    $("key-state").textContent = "Состояние подключения недоступно.";
+    renderMode();
+    $("connection").textContent="● Нет связи с сервером";$("connection").className="offline";
+  }
   finally{busy=false;}
 }
 window.addEventListener("hashchange",navigate);
 loadSettings().catch(()=>notify("Не удалось загрузить настройки. Проверьте, запущен ли сервер, и обновите страницу.",true));
-loadHealth().catch(() => { $("key-state").textContent = "Состояние подключения недоступно."; });
 navigate();setInterval(refresh,1200);
