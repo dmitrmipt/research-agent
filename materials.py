@@ -10,30 +10,49 @@ import subprocess
 import sys
 import time
 from html import escape
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from manuscripts import SOURCE_FILES
+from bibliographic import reference_text
 from version import VERSION
 
 PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
-MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", *SOURCE_FILES)
-PROFILE_VERSION = 5
+MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
+PROFILE_VERSION = 9
+EXTRACTION_VERSION = 1
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
+PAREN_REFERENCE = re.compile(r"^[ \t]*(\d{1,4})\)[ \t]+(?=\S)", re.M)
+NUMBERED_REFERENCE = re.compile(r"^[ \t]*(?:\[(\d{1,4})\]|(\d{1,4})[.)])[ \t]+(?=\S)", re.M)
 REFERENCE_SIGNAL = re.compile(r"\b(?:18|19|20)\d{2}\b|arxiv\s*:|10\.\d{4,9}/", re.I)
 SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) materials?|дополнительные материалы)(?: for\b.*)?$")
 LETTERED_APPENDIX_HEADING = re.compile(r"^A\s+[A-Z][^\s,.;]*\s+[^,.;]{1,140}$")
 BIBLIOGRAPHIC_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
 AUTHOR_YEAR_START = re.compile(rf"^[^\W\d_][^,\d]{{0,59}},\s+(?:[^\W\d_]\.\s*)+[^()]{{0,220}}\({BIBLIOGRAPHIC_YEAR}\)\.")
+RMP_SURNAME = r"^(?P<surname>[^\W\d_][^,.\d()]{0,59}),\s+"
+RMP_INITIALS = r"(?:[^\W\d_]\.\s*(?:-\s*[^\W\d_]\.\s*)?)+"
+RMP_REFERENCE_LEAD = re.compile(rf"{RMP_SURNAME}{RMP_INITIALS},")
+RMP_REFERENCE_START = re.compile(rf"{RMP_SURNAME}(?:{RMP_INITIALS}|[A-Z][^,.\d()]{{1,50}}),"
+                                 rf"\s*(?:(?P<coauthors>[^\d]{{1,1000}}?),\s*)?"
+                                 rf"(?P<year>{BIBLIOGRAPHIC_YEAR}),\s*")
+RMP_TITLE = re.compile(r'[“"]([^”"]+)[”"],?\s*')
+CITATION_ANCHOR = r"[0-9]{1,6}-[0-9]{1,6}-[0-9]{1,6}"
 REFERENCE_YEAR_END = re.compile(rf"\b{BIBLIOGRAPHIC_YEAR}(?:[)\]]\.?|\.)$")
 DISPLAY_YEAR = re.compile(rf"\((?P<parenthesized>{BIBLIOGRAPHIC_YEAR})\)|(?<![\w.])(?P<trailing>{BIBLIOGRAPHIC_YEAR})(?=\s*[)\]]?\.?\s*$)")
 ABSTRACT_HEADING = re.compile(r"^(?:abstract|аннотация)\s*[:.—–-]\s*(\S.*)$", re.I)
 ABSTRACT_END = re.compile(r"^(?:key\s?words|index terms|pacs|ключевые слова)\s*[:.—–-]", re.I)
 REFERENCE_LINK_LINE = re.compile(r"^(?:(?:url|doi)\s*:?\s*)?(?:https?://|10\.\d{4,9}/)|^arxiv\s*:", re.I)
 REFERENCE_AUTHOR = re.compile(r"^(?:and\s+)?(?:[A-ZА-ЯЁ]\.\s*(?:-\s*[A-ZА-ЯЁ]\.\s*)?)+[^\W\d_]\D*$")
+AUTHOR_TITLE_SEPARATOR = re.compile(r"(?<!\b[^\W\d_])\.\s*(?=\S)")
+SURNAME_INITIALS = r"[^,.;:\d]{1,85}?\s+[A-Z]{1,4}(?:\s+[A-Z]){0,3}"
+VANCOUVER_AUTHORS = re.compile(rf"^(?P<authors>{SURNAME_INITIALS}(?:,\s*{SURNAME_INITIALS})*(?:,\s*et al)?)\.\s+")
+VANCOUVER_PUBLICATION = re.compile(rf"^(?P<venue>.+?)\.\s*(?P<year>{BIBLIOGRAPHIC_YEAR});\s*(?P<coords>\S+)")
+QUOTED_REFERENCE_TITLE = re.compile(r'^(?P<authors>[^“"]+?),\s*[“"](?P<title>[^”"]+)[”"]\s*[,.;]?\s*')
+YEAR_BEFORE_PAGE = re.compile(rf"^.+?\d+\s*\({BIBLIOGRAPHIC_YEAR}\)\s*\d+\b")
 REFERENCE_VENUE = re.compile(
     r"(?:^|,\s*)(?=(?i:in\s+|arxiv\b|doi:|https?://)|inProceedings)"
     rf"|(?:^|,\s*)(?P<journal>[^,()]{{2,100}}\d+\s*(?:\(\d+\))?\s*,\s*[A-Z]?\d[\w–—-]*\s*(?:\({BIBLIOGRAPHIC_YEAR}\)|,\s*{BIBLIOGRAPHIC_YEAR}\b)\.?)"
@@ -56,6 +75,13 @@ SECTION_NAMES = {
     "supplementary material": "Приложение", "data availability": "Данные",
     "code availability": "Код",
 }
+
+
+def extraction_signature():
+    try:
+        return f"{EXTRACTION_VERSION}/pypdf/{package_version('pypdf')}"
+    except PackageNotFoundError:
+        return f"{EXTRACTION_VERSION}/pypdf/unavailable"
 
 
 class MaterialError(RuntimeError):
@@ -185,11 +211,12 @@ def extract_pdf(raw, checkpoint):
 
 def _reference_start(lines, next_page):
     for index, line in enumerate(lines):
-        marker = BRACKET_REFERENCE.match(line)
+        pattern = BRACKET_REFERENCE if line.lstrip().startswith("[") else PAREN_REFERENCE
+        marker = pattern.match(line)
         if not marker or marker[1] != "1":
             continue
         text = "\n".join(lines[index:] + next_page)
-        markers = list(BRACKET_REFERENCE.finditer(text))[:4]
+        markers = list(pattern.finditer(text))[:4]
         if [marker[1] for marker in markers[:3]] != ["1", "2", "3"]:
             continue
         ends = [marker.start() for marker in markers[1:]] + [len(text)]
@@ -221,12 +248,14 @@ def split_sections(pages):
     parts = []
     section = "Основной текст"
     appended_supplement = False
+    separate_supplement = False
     last_reference_line = ""
     for page, text in enumerate(pages, start=1):
         lines = []
         page_lines = text.splitlines()
         if appended_supplement:
-            parts.append({"section": "Приложение", "page": page, "text": text})
+            parts.append({"section": "Приложение", "page": page, "text": text,
+                          "separate_supplement": separate_supplement})
             continue
         next_page = pages[page].splitlines() if page < len(pages) else []
         reference_start = _reference_start(page_lines, next_page) if section != "Библиография" else None
@@ -248,6 +277,7 @@ def split_sections(pages):
                 heading = "Приложение"
             if heading == "Приложение" and section == "Библиография":
                 appended_supplement = True
+                separate_supplement = bool(supplement)
             if index == reference_start:
                 heading = "Библиография"
             if section == "Приложение" and heading != "Библиография":
@@ -266,7 +296,10 @@ def split_sections(pages):
             if section == "Библиография" and line and not line.isdecimal():
                 last_reference_line = line
         if lines:
-            parts.append({"section": section, "page": page, "text": "\n".join(lines)})
+            part = {"section": section, "page": page, "text": "\n".join(lines)}
+            if separate_supplement:
+                part["separate_supplement"] = True
+            parts.append(part)
     return parts
 
 
@@ -281,33 +314,14 @@ def abstract_from_parts(parts):
     return ""
 
 
-def excerpts(parts, abstract, budget):
-    snippets = []
-    for part in parts:
-        if part["section"] in {"Библиография", "Благодарности"}:
-            continue
-        text = compact(part["text"])
-        for offset in range(0, len(text), 2000):
-            snippets.append({"id": f"s{len(snippets) + 1}", "page": part["page"],
-                             "section": part["section"], "text": text[offset:offset + 2000]})
-    capacity = max(1, budget // 2000)
-    sampled = len(snippets) > capacity
-    if sampled:
-        indices = [round(i * (len(snippets) - 1) / max(1, capacity - 1)) for i in range(capacity)]
-        snippets = [snippets[i] for i in indices]
-    if abstract:
-        snippets.insert(0, {"id": "abstract", "page": None, "section": "Аннотация arXiv",
-                            "text": compact(abstract, 4000)})
-    return snippets, sampled
-
-
 def document_text(document):
     return "\n\n".join(f"--- Страница {number} ---\n{text or '[Текст не извлечён]'}"
                        for number, text in enumerate(document["pages"], start=1)) + "\n"
 
 
 def saved_pages(text):
-    return re.split(r"^--- Страница \d+ ---\n", text, flags=re.M)[1:]
+    pages = re.split(r"^--- Страница \d+ ---\n", text, flags=re.M)[1:]
+    return ["" if page == "[Текст не извлечён]" else page for page in map(str.strip, pages)]
 
 
 def material_name(source):
@@ -388,7 +402,7 @@ class MaterialLibrary:
             self._discard(cleanup)
         self._discard(prepare)
 
-    def publish(self, source, pdf, text, profile, manuscript=None):
+    def publish(self, source, pdf, text, profile, manuscript=None, document=None):
         """Publish the current files or restore the previous profile after failure."""
         folder = self.folder(source)
         folder.mkdir(exist_ok=True)
@@ -404,6 +418,14 @@ class MaterialLibrary:
             (new / "text.txt").write_text(text, encoding="utf-8")
             (new / "profile.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             (new / "profile.md").write_text(render_markdown(profile), encoding="utf-8")
+            if document is not None:
+                cache = {"version": EXTRACTION_VERSION, "parser": extraction_signature(),
+                         "sha256": profile["article"]["sha256"], "document": document}
+                (new / "document.json").write_text(json.dumps(cache, ensure_ascii=False), encoding="utf-8")
+            elif previous and previous["article"].get("sha256") == profile["article"].get("sha256"):
+                saved_cache = self._direct(folder / "document.json")
+                if saved_cache.is_file():
+                    shutil.copyfile(saved_cache, new / "document.json")
             filename = profile["article"].get("manuscript", {}).get("file")
             if filename in SOURCE_FILES:
                 (new / filename).write_bytes(self.read(source, filename) if manuscript is None else manuscript)
@@ -416,7 +438,7 @@ class MaterialLibrary:
                 staged = rollback / "new" / name
                 if staged.is_file():
                     staged.replace(folder / name)
-                elif name == old_manuscript and (rollback / "old" / name).is_file():
+                elif (name == old_manuscript or name == "document.json") and (rollback / "old" / name).is_file():
                     (folder / name).unlink(missing_ok=True)
             self._rename_directory(rollback, cleanup)
         except OSError:
@@ -443,7 +465,7 @@ def _reference_year(text):
 
 
 def _reference_publication(entry, details, year=""):
-    details = re.split(r"\b(?:URL|DOI)\s*:|https?://", details, maxsplit=1, flags=re.I)[0].rstrip(" ,;.")
+    details = re.split(r"\b(?:URL|DOI|arXiv)\s*:|https?://|\(Cited on pages?\b", details, maxsplit=1, flags=re.I)[0].rstrip(" ,;.")
     details, cited_year = _reference_year(details)
     publication = entry.get("publication", {})
     journal, volume, issue, pages = (publication.get(key) or "" for key in ("journal", "volume", "issue", "pages"))
@@ -454,48 +476,103 @@ def _reference_publication(entry, details, year=""):
     return details, f"({year})" if re.fullmatch(r"\d{4}", year) else ""
 
 
+def _vancouver_reference(text):
+    authors = VANCOUVER_AUTHORS.match(text)
+    if not authors:
+        return None
+    body = text[authors.end():]
+    separator = AUTHOR_TITLE_SEPARATOR.search(body)
+    if not separator:
+        return None
+    title = body[:separator.start()]
+    details = body[separator.end():]
+    publication = VANCOUVER_PUBLICATION.match(details)
+    if publication:
+        venue = f'{publication["venue"]}, {publication["coords"].rstrip(".")}'
+        return authors["authors"], title, venue, publication["year"][:4]
+    if re.match(r"(?:In:\s|Zenodo\b)", details):
+        venue = details.split("Available from:", 1)[0]
+        date = re.search(rf";\s*({BIBLIOGRAPHIC_YEAR})\.(?=\s|$)", venue)
+        if date:
+            venue = (venue[:date.start()] + "," + venue[date.end():]).rstrip(" ,.")
+        return authors["authors"], title, venue, date[1][:4] if date else ""
+    return None
+
+
 def _reference_item(entry):
-    chunks = [chunk.strip() for chunk in entry["text"].split(",")]
+    raw = re.sub(r"\b([A-Z])\s+\.", r"\1.", entry["text"])
+    raw = re.sub(r"\s*\(Cited on pages? [^()]+\)\.?\s*$", "", raw)
+    chunks = [chunk.strip() for chunk in raw.split(",")]
     author_count = 0
     for chunk in chunks:
-        if REFERENCE_AUTHOR.match(chunk) or (author_count and chunk.casefold() == "et al."):
+        name = re.sub(r"(?<=\w)[-´`]\s+(?=\w)", "", re.sub(r"^and\s+", "", chunk))
+        if (REFERENCE_AUTHOR.match(chunk) and full_author_names(name)) or (author_count and chunk.casefold() == "et al."):
             author_count += 1
         else:
             break
     authors = ", ".join(chunks[:author_count]) or entry.get("authors", "")
     citation = ", ".join(chunks[author_count:])
-    name_line, dot, remainder = citation.partition(". ")
+    author_end = AUTHOR_TITLE_SEPARATOR.search(citation)
+    name_line = citation[:author_end.start()] if author_end else citation
+    remainder = citation[author_end.end():] if author_end else ""
     year = ""
-    author_year = AUTHOR_YEAR_START.match(entry["text"])
-    if author_year:
+    author_year = (AUTHOR_YEAR_START.match(raw) if not re.match(r"^(?:and\s+)?[A-ZА-ЯЁ]\.", raw) else None)
+    rmp = RMP_REFERENCE_START.match(raw) if not entry["number"] else None
+    quoted_reference = QUOTED_REFERENCE_TITLE.match(raw)
+    vancouver = _vancouver_reference(raw)
+    colon_authors, colon, after_colon = raw.partition(": ")
+    if rmp:
+        authors = raw[:rmp.start("year")].rstrip(" ,")
+        year = rmp["year"][:4]
+        details = raw[rmp.end():]
+        quoted = RMP_TITLE.match(details)
+        title = quoted[1].rstrip(",") if quoted else ""
+        if quoted:
+            details = details[quoted.end():]
+    elif quoted_reference:
+        authors = quoted_reference["authors"] if full_author_names(quoted_reference["authors"]) else authors
+        title = quoted_reference["title"].strip(" ,;.")
+        details = raw[quoted_reference.end():]
+    elif vancouver:
+        authors, title, details, year = vancouver
+    elif colon and full_author_names(colon_authors) and (YEAR_BEFORE_PAGE.match(after_colon) or REFERENCE_LINK_LINE.match(after_colon)):
+        authors, title, details = colon_authors, "", after_colon
+    elif author_year:
         authors, year = author_year[0].rsplit("(", 1)
         authors, year = authors.strip(" ,"), year[:4]
-        title, _, details = entry["text"][author_year.end():].strip().partition(". ")
-    elif not author_count and dot and full_author_names(name_line):
-        authors = name_line
+        title, _, details = raw[author_year.end():].strip().partition(". ")
+    elif author_end and full_author_names(re.sub(r"\s+et al\.?$", "", name_line)):
+        authors = ", ".join([*chunks[:author_count], name_line])
         title, *venue = re.split(r"(?<!\b[A-Z])\.\s*(?=[A-Z]|arXiv\b)", remainder, maxsplit=1)
         details = venue[0] if venue else ""
     else:
         venue = REFERENCE_VENUE.search(citation)
-        title = citation[:venue.start()].strip() if venue else citation
-        details = (venue["journal"] or citation[venue.start():].lstrip(", ")) if venue else ""
+        title = citation[:venue.start()].strip() if venue else "" if YEAR_BEFORE_PAGE.match(citation) else citation
+        details = (venue["journal"] or citation[venue.start():].lstrip(", ")) if venue else "" if title else citation
     if not details or REFERENCE_LINK_LINE.match(details):
         remaining, trailing_year = _reference_year(title.rstrip(" ,;."))
         if trailing_year:
             name, comma, venue = remaining.rpartition(", ")
             title, details = (name, venue) if comma else (remaining, details)
             year = trailing_year
+    title = title.strip(" ,;.")
+    if (REFERENCE_LINK_LINE.match(title) or re.match(r"^(?:and\s+)?[A-ZА-ЯЁ]\.\s", title)
+            or (not authors and re.search(r"\b(?:URL|DOI)\s*:|https?://", title, re.I))
+            or re.match(r"^(?:Nature(?:\s*\([^)]*\))?|Science|Phys(?:ical)?\.?\s*Rev(?:iew)?\.?[^,]*)\s*\d", title, re.I)):
+        title = ""
+    if not title and not details:
+        details = citation
     details, year = _reference_publication(entry, details, year)
-    label = entry.get("title") or title
-    if not label:
-        label, details = details or entry["text"], ""
+    missing = not (entry.get("title") or title)
+    label = entry.get("title") or title or "Название не установлено"
     citations = []
     for location in entry.get("citations", []):
         page, section = location["page"], location["section"]
         label_suffix = f" · {section}" if section != "Основной текст" else ""
-        citations.append({"page": page, "label": f"с. {page}{label_suffix}"})
+        citations.append({"page": page, "label": f"с. {page}{label_suffix}",
+                          "anchor": location.get("anchor", ""), "context": location.get("context", "")})
     return {"label": label, "text": " ".join(filter(None, (details, year))), "href": web_link(entry["url"]),
-            "number": entry["number"], "authors": authors, "citations": citations}
+            "number": entry["number"], "authors": authors, "citations": citations, "missing_title": missing}
 
 
 def _analog_pdf_page(analog):
@@ -528,18 +605,35 @@ def profile_sections(profile):
     if article["filename"]:
         metadata.append(item("Имя исходного файла", article["filename"]))
     usage = profile["usage"]
-    coverage_items = [item("Основа анализа", coverage["basis"]),
-                      item("Страницы с текстом", f'{coverage["read_pages"]} из {coverage["page_count"] if coverage["page_count"] is not None else "неизвестного числа"}'),
-                      item("Фокус внимания", profile["questions"] or "Не указан"),
-                      item("API", f'{usage["model"] or "Модель не вызывалась"} · запросов: {usage["calls"]} · вход: {usage["input_tokens"]} · выход: {usage["output_tokens"]} токенов')]
+    page_count = coverage["page_count"]
+    pages = f'{coverage["read_pages"]} из {page_count}' if page_count is not None else str(coverage["read_pages"])
+    coverage_items = [item("Основа анализа", coverage["basis"]), item("Страницы с текстом", pages)]
+    coverage_details = [item("API", f'{usage["model"] or "Модель не вызывалась"} · запросов: {usage["calls"]} · вход: {usage["input_tokens"]} · выход: {usage["output_tokens"]} токенов')]
+    if profile["questions"]:
+        coverage_details.append(item("Фокус внимания", profile["questions"]))
+    selection = coverage.get("selection")
+    if profile.get("reference_search_note"):
+        coverage_details.append(item("Уточнение названий", profile["reference_search_note"]))
+    if selection:
+        budget = selection["budget_chars"]
+        scope = f'Лимит — {budget} символов.' if budget is not None else "Выбран полный текст."
+        label = "Передано модели" if usage["calls"] else "Подготовлено для модели"
+        coverage_items.append(item(label, f'{selection["selected_fragments"]} из {selection["available_fragments"]} фрагментов · '
+                                   f'{selection["selected_chars"]} из {selection["available_chars"]} символов. {scope}'))
+        coverage_details.append(item("Страницы основных фрагментов", ", ".join(map(str, selection["pages"])) or "Только аннотация"))
+        if selection.get("reference_records"):
+            coverage_details.append(item("Дополнительно для библиографии", f'{selection["reference_records"]} записей и контекст цитирования · страницы '
+                                       + ", ".join(map(str, selection["reference_pages"]))))
+        if selection["sampled"]:
+            coverage_details.append(item("Отбор текста", "Общий охват и фрагменты по вопросам (локальный поиск по терминам)."
+                                       if selection["question_focused"] else "Общий охват разделов статьи."))
     if coverage["sections"]:
-        coverage_items.append(item("Распознанные разделы", ", ".join(coverage["sections"])))
+        coverage_details.append(item("Распознанные разделы", ", ".join(coverage["sections"])))
     if usage["reported_calls"] < usage["calls"]:
-        coverage_items.append(item("Данные об использовании", "Для части запросов данные о токенах не получены."))
+        coverage_details.append(item("Данные об использовании", "Для части запросов данные о токенах не получены."))
     claims = [
-        {**item(claim["statement"]), "details": [
+        {**item(claim["statement"]), "byline": claim["basis"], "details": [
             *([item("Пояснение", claim["explanation"])] if claim.get("explanation") else []),
-            item("Основание", claim["basis"]),
             {**item("Подтверждающий фрагмент", f'«{claim["evidence"]}»'),
              "location": claim["location"], "page": claim.get("page")},
             *([item("Проверить", claim["check"])] if claim["check"] else []),
@@ -548,8 +642,15 @@ def profile_sections(profile):
     summary = content["summary"]
     if profile["schema_version"] < 5 and summary:
         summary = [" ".join(summary)]
-    answers = [item(reply["question"], ("Недостаточно данных. " if reply["status"] == "insufficient" else "") + reply["answer"])
-               for reply in content.get("answers", [])]
+    answers = []
+    for reply in content.get("answers", []):
+        prefix = {"insufficient": "Недостаточно данных в выбранных фрагментах. ",
+                  "unverified": "Подтверждение источником не сохранено или не найдено. ", "missing": ""}.get(reply["status"], "")
+        answer = item(reply["question"], prefix + reply["answer"])
+        answer["details"] = [item("Ответ", answer["text"])] + [
+            {**item("Источник", f'«{source["evidence"]}»'), "location": source["location"], "page": source.get("page")}
+            for source in reply.get("sources", [])]
+        answers.append(answer)
     glossary = [item(definition["term"], "\n".join(filter(None, (definition["explanation"], definition["role"]))))
                 for definition in content.get("glossary", [])]
     subsections = [{"key": key, "title": title, "items": items} for key, title, items in (
@@ -600,7 +701,9 @@ def profile_sections(profile):
             search_items.append(item(f'Отбор · {rejected["title"]}', rejected["reason"]))
     return [
         {"key": "article", "title": "О статье", "paragraphs": [], "items": metadata},
-        {"key": "coverage", "title": "Что прочитано", "paragraphs": coverage["notes"], "items": coverage_items},
+        {"key": "coverage", "title": "Что прочитано", "paragraphs": coverage["notes"], "items": coverage_items,
+         "steps": profile.get("steps", {}),
+         "subsections": [{"key": "coverage-details", "title": "Подробности чтения", "items": coverage_details}]},
         {"key": "overview", "title": "Краткий обзор", "paragraphs": summary or ["Обзор недоступен."],
          "items": [], "subsections": subsections},
         {"key": "keywords", "title": "Ключевые слова и темы", "paragraphs": [] if keywords else ["Не выделены."], "items": keywords},
@@ -630,12 +733,14 @@ def _markdown_item(key, item):
             lines.append("  " + _markdown_text(item["authors"]))
         if item["text"]:
             lines.append("  " + _markdown_text(item["text"]))
-        if item["citations"]:
-            mentions = " · ".join(f'[{_markdown_text(place["label"])}](article.pdf#page={place["page"]})'
-                                  for place in item["citations"])
-            lines.append("  В тексте · " + mentions)
+        for place in item["citations"]:
+            fragment = f'page={place["page"]}'
+            if place["anchor"]:
+                fragment += "&citation=" + place["anchor"]
+            context = f' · {_markdown_text(place["context"])}' if place["context"] else ""
+            lines.append(f'  В тексте · [{_markdown_text(place["label"])}](article.pdf#{fragment}){context}')
         return [line + "  " for line in lines[:-1]] + lines[-1:]
-    if key in {"analogs", "claims"}:
+    if item.get("details"):
         lines = ["- **" + label + "**"]
         if item.get("byline"):
             lines.append("  " + _markdown_text(item["byline"]))
@@ -664,6 +769,15 @@ def render_markdown(profile):
             lines.extend([_markdown_text(paragraph), ""])
         for item in section["items"]:
             lines.extend(_markdown_item(section["key"], item))
+        if steps := section.get("steps"):
+            labels = {"material": "Материалы", "core": "Основной профиль", "references": "Библиография",
+                      "analogs": "Аналоги", "manuscript": "Исходник"}
+            statuses = {"pending": "Ожидает", "running": "Выполняется", "completed": "Готово", "skipped": "Пропущено",
+                        "failed": "Ошибка", "blocked": "Требуется действие", "not_applicable": "Не требуется"}
+            lines.extend(["", "### Этапы обработки", ""])
+            for key, step in steps.items():
+                message = " · " + _markdown_text(step["message"]) if step.get("message") else ""
+                lines.append(f'- **{labels.get(key, key)}** — {statuses.get(step["status"], step["status"])}{message}')
         lines.append("")
         for subsection in section.get("subsections", []):
             lines.extend(["### " + subsection["title"], ""])
@@ -686,6 +800,11 @@ def render_markdown_preview(data, snapshot):
             for child in token.children or []:
                 if child.type == "link_open":
                     path, marker, fragment = child.attrGet("href").partition("#")
+                    citation = re.fullmatch(rf"page=\d+&citation=({CITATION_ANCHOR})", fragment)
+                    if path == "article.pdf" and citation:
+                        query = urlencode({"at": citation[1], "snapshot": snapshot})
+                        child.attrSet("href", f"citation.html?{query}#citation")
+                        continue
                     if path == "manuscript.tex":
                         path = "manuscript.html"
                         child.attrSet("href", path)
@@ -703,6 +822,36 @@ def render_markdown_preview(data, snapshot):
 <body><main class="profile-document">
   <p class="profile-document-version">Research Agent {VERSION}</p>
   {content}
+</main></body>
+</html>
+"""
+
+
+def render_citation_preview(data, anchor, snapshot):
+    if not re.fullmatch(CITATION_ANCHOR, anchor):
+        return None
+    index, start, end = map(int, anchor.split("-"))
+    pages = saved_pages(data.decode("utf-8-sig").replace("\r\n", "\n"))
+    parts = split_sections(pages)
+    if index >= len(parts) or not start < end <= len(parts[index]["text"]):
+        return None
+    part = parts[index]
+    text = part["text"]
+    before, citation, after = escape(text[:start]), escape(text[start:end]), escape(text[end:])
+    pdf = "article.pdf" + (f"?snapshot={quote(snapshot, safe='')}" if snapshot else "") + f'#page={part["page"]}'
+    location = f'Страница {part["page"]} · {part["section"]}'
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Цитата в тексте · Research Agent</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body><main class="profile-document">
+  <h1>{escape(location)}</h1>
+  <p><a href="{escape(pdf)}">Открыть страницу PDF</a></p>
+  <pre class="citation-text">{before}<mark id="citation">{citation}</mark>{after}</pre>
 </main></body>
 </html>
 """

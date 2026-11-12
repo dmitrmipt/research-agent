@@ -2,6 +2,7 @@ import base64
 import json
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -114,6 +115,20 @@ class AppTest(unittest.TestCase):
         time.sleep(.3)
         self.assertFalse(any(j['status'] in ('queued', 'running') for j in self.call('/api/jobs')))
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux TCP port reuse')
+    def test_restart_on_same_port_after_ctrl_c(self):
+        with socket.create_connection(('127.0.0.1', self.port), timeout=5) as client:
+            request = f'GET /api/health HTTP/1.0\r\nHost: 127.0.0.1:{self.port}\r\n\r\n'
+            client.sendall(request.encode('ascii'))
+            # Wait for the server to close first so the listening port has a TIME_WAIT connection.
+            with client.makefile('rb') as response:
+                self.assertTrue(response.read().startswith(b'HTTP/1.0 200'))
+        self.process.send_signal(signal.SIGINT)
+        self.assertEqual(self.process.wait(timeout=5), 0)
+        self.kill()
+        self.start()
+        self.assertTrue(self.call('/api/health')['worker_alive'])
+
     def test_failure_and_time_limit(self):
         self.settings(stage_seconds=1)
         job = self.create(scenario='error')
@@ -146,11 +161,27 @@ class AppTest(unittest.TestCase):
             self.assertIn('Новый разбор', response.read().decode())
             self.assertIn("frame-ancestors 'none'", response.headers['Content-Security-Policy'])
 
+    def test_local_fonts_are_served_without_exposing_other_files(self):
+        for name, mime, signature in (
+            ('InterVariable.woff2', 'font/woff2', b'wOF2'),
+            ('PTSerif-Regular.ttf', 'font/ttf', b'\x00\x01\x00\x00'),
+            ('PTSerif-Bold.ttf', 'font/ttf', b'\x00\x01\x00\x00'),
+        ):
+            with self.subTest(font=name), urlopen(self.url + '/fonts/' + name) as response:
+                self.assertEqual(response.headers.get_content_type(), mime)
+                self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
+                self.assertTrue(response.read().startswith(signature))
+        for path in ('/fonts/unknown.ttf', '/fonts/../app.py', '/fonts/%2e%2e%2fapp.py'):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as error:
+                urlopen(self.url + path)
+            self.assertEqual(error.exception.code, 404)
+
     def test_second_instance_cannot_interrupt_jobs(self):
         job = self.create()
         self.wait_status(job['id'], ['running'])
         process = subprocess.run([sys.executable, str(ROOT / 'app.py'), '--port', str(self.port), '--data-dir', str(self.temp)], capture_output=True, timeout=4)
         self.assertNotEqual(process.returncode, 0)
+        self.assertIn(f'Port {self.port} is unavailable.', process.stderr.decode())
         self.assertEqual(self.call('/api/jobs/' + job['id'])['status'], 'running')
 
 

@@ -26,6 +26,7 @@ from manuscripts import select_manuscript
 from materials import MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _reference_item, document_text, split_sections
 from publications import Http, Publications, ServiceError
 from research import BIBLIOGRAPHY_MISSING, _candidate_snippets, bibliography, reference_url
+from pipeline import Pipeline, StepExpired
 
 ROOT = Path(__file__).resolve().parents[1]
 FOCAL = "2409.10975"
@@ -124,6 +125,7 @@ class ResearchTest(TempTest):
         self.fail_atom = False
         self.arxiv_pages = []
         self.fail_model = False
+        self.fail_catalog = False
         self.empty_analogs = False
         self.model_arrived = threading.Event()
         self.resume_model = threading.Event()
@@ -205,6 +207,10 @@ class ResearchTest(TempTest):
                 return json.dumps({"message": {"items": [journal, citation("10.1234/no-text", "Metadata only", "")]}}).encode()
             return json.dumps({"message": citation("10.1234/older", "Cited apparatus", "The authors report a microwave calibration.")}).encode()
         if parts.hostname == "api.openai.com":
+            if parts.path == "/v1/models":
+                if self.fail_catalog:
+                    raise ServiceError("OpenAI: HTTP 401.", status=401)
+                return json.dumps({"data": [{"id": "gpt-6-luna"}, {"id": "gpt-6.1-sol"}, {"id": "text-embedding-3-small"}]}).encode()
             self.assertEqual(parts.path, "/v1/responses")
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fixture-key")
             request = json.loads(kwargs["data"])
@@ -214,6 +220,9 @@ class ResearchTest(TempTest):
             self.assertFalse(request["store"])
             self.assertTrue(request["text"]["format"]["strict"])
             inputs = json.loads(request["input"])
+            if request["text"]["format"]["name"] == "reference_titles":
+                return responses({"reference_hints": [{"reference_id": entry["reference_id"], "title": "", "evidence": "",
+                                                        "search_query": entry["text"]} for entry in inputs["references"]]})
             if request["text"]["format"]["name"] == "article_profile":
                 self.model_arrived.set()
                 self.resume_model.wait(8)
@@ -221,7 +230,8 @@ class ResearchTest(TempTest):
                 claim = {"statement": "Измерена разница 4 дБ.", "kind": "measurement", "snippet": snippet["id"],
                          "evidence": QUOTE, "locator": "Несуществующий рисунок 9", "check": "Проверить калибровку.",
                          "explanation": "Разница относится к измеренным спектрам. Температура образца составила 20 мК."}
-                answers = [{"question_id": question["question_id"], "answer": reply, "status": status}
+                answers = [{"question_id": question["question_id"], "answer": reply, "status": status,
+                            "sources": [{"snippet": snippet["id"], "evidence": QUOTE}] if status == "answered" else []}
                            for question, (reply, status) in zip(inputs["questions"], (
                                ("Измерена разница 4 дБ.", "answered"), ("Не указан предел шума.", "insufficient"),
                            ))]
@@ -236,7 +246,7 @@ class ResearchTest(TempTest):
                                                for term, weight in [("microwave", 5), ("probe", 4), ("calibration", 3), ("spectra", 2), ("temperature", 1)]],
                                   "topics": ["Микроволновые измерения"],
                                   "claims": [claim, {**claim, "statement": "Выдуманное утверждение.", "evidence": "A fabricated sentence."}],
-                                  "search_terms": ["microwave probe", "superconducting spectra"]})
+                                  "search_terms": ["microwave probe", "superconducting spectra"], "reference_hints": []})
             if self.empty_analogs:
                 return responses({"analogs": []})
             self.assertNotIn("evidence", request["text"]["format"]["schema"]["properties"]["analogs"]["items"]["properties"])
@@ -293,12 +303,13 @@ class ResearchTest(TempTest):
         initial_files = {name: (folder / name).read_bytes() for name in names}
         self.assertEqual(initial_files["manuscript.tex"], TEX + b"v3")
         self.assertEqual(self.call(path + "/manuscript.tex", raw=True), TEX + b"v3")
-        source = self.call(path + "/manuscript.html?snapshot=" + job["id"], raw=True).decode()
+        revision = initial["profile"]["revision"]
+        source = self.call(path + "/manuscript.html?snapshot=" + revision, raw=True).decode()
         self.assertIn('<span class="tex-command">\\documentclass</span>', source)
         self.assertIn('<span class="tex-math">$</span>', source)
         self.assertIn("&lt;script&gt;fixture&lt;/script&gt;", source)
         self.assertNotIn("<script>", source)
-        self.assertIn(f'manuscript.tex?snapshot={job["id"]}', source)
+        self.assertIn(f'manuscript.tex?snapshot={revision}', source)
         (folder / "notes.txt").write_text("Reader notes", encoding="utf-8")
 
         same = self.settled(self.call(path + "/refresh", {}))
@@ -390,7 +401,7 @@ class ResearchTest(TempTest):
         overview = next(section for section in paper["sections"] if section["key"] == "overview")
         self.assertEqual(len(overview["paragraphs"]), 2)
         self.assertEqual([sub["key"] for sub in overview["subsections"]], ["answers", "glossary"])
-        self.assertTrue(overview["subsections"][0]["items"][1]["text"].startswith("Недостаточно данных."))
+        self.assertTrue(overview["subsections"][0]["items"][1]["text"].startswith("Недостаточно данных в выбранных фрагментах."))
         self.assertEqual(content["resources"][0]["kind"], "Код")
         self.assertIn(MOLLOW, self.crossref_queries)
         self.assertEqual([entry["number"] for entry in content["references"]], ["1", "2", "3"])
@@ -401,7 +412,9 @@ class ResearchTest(TempTest):
         self.assertEqual(references[2]["label"], "Power spectrum of light scattered by two-level systems")
         self.assertEqual(references[2]["authors"], "B. R. Mollow")
         self.assertEqual(references[2]["text"], "Physical Review 188, 1969-1975 (1969)")
-        self.assertEqual(references[2]["citations"], [{"page": 1, "label": "с. 1 · Введение"}])
+        citation, = references[2]["citations"]
+        self.assertEqual((citation["page"], citation["label"]), (1, "с. 1 · Введение"))
+        self.assertIn("Prior experiments are described in [1-3]", citation["context"])
         matches = {entry["title"]: entry for entry in content["analogs"]}
         self.assertIn("Cited apparatus", matches)
         self.assertIn("предварительно", matches["Journal comparison"]["basis"])
@@ -427,12 +440,24 @@ class ResearchTest(TempTest):
         self.assertIn("### Ответы на вопросы", markdown.decode())
         self.assertIn("### Словарь терминов", markdown.decode())
         self.assertIn("(article.pdf#page=1)", markdown.decode())
-        preview_path = path + "/profile.html?snapshot=" + job["id"]
+        revision = profile["revision"]
+        preview_path = path + "/profile.html?snapshot=" + revision
         preview = self.call(preview_path, raw=True).decode()
         self.assertIn("<h1>Uploaded paper</h1>", preview)
         self.assertIn("B. R. Mollow<br>", preview)
         self.assertNotIn("<strong>B. R. Mollow</strong>", preview)
-        self.assertIn(f'href="article.pdf?snapshot={job["id"]}#page=1"', preview)
+        self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', preview)
+        at = citation["anchor"]
+        self.assertIn(f'href="citation.html?at={at}&amp;snapshot={revision}#citation"', preview)
+        source = self.call(f"{path}/citation.html?at={at}&snapshot={revision}", raw=True).decode()
+        self.assertIn('Prior experiments are described in <mark id="citation">[1-3]</mark>', source)
+        self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', source)
+        with self.assertRaises(HTTPError) as missing_citation:
+            self.call(f"{path}/citation.html?at=999-1-9&snapshot={revision}", raw=True)
+        self.assertEqual(missing_citation.exception.code, 404)
+        with self.assertRaises(HTTPError) as stale_citation:
+            self.call(f"{path}/citation.html?at={at}&snapshot=obsolete", raw=True)
+        self.assertEqual(stale_citation.exception.code, 409)
         self.assertIn(f'href="https://arxiv.org/pdf/{NEIGHBOR}v2#page=1"', preview)
 
         with (folder / "profile.md").open("a", encoding="utf-8") as saved:
@@ -458,7 +483,7 @@ class ResearchTest(TempTest):
         self.assertEqual(profile["content"]["analogs"], [])
         self.assertEqual(len(profile["content"]["references"]), 3)
         self.assertEqual(profile["content"]["references"][2]["url"], PUBLISHER)
-        self.assertTrue(any("лимита" in note for note in profile["coverage"]["notes"]))
+        self.assertEqual(profile["steps"]["analogs"]["code"], "call_limit")
 
     def test_blank_pdf_saves_partial_profile_without_calling_model(self):
         job = self.uploaded(pdf_bytes("Image-only fixture", blank=True))
@@ -543,8 +568,266 @@ class ResearchTest(TempTest):
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(self.crossref_queries, [])
 
+    def test_timeout_after_core_preserves_profile_and_continuation_skips_core(self):
+        def expire(pipeline):
+            pipeline.deadline = 0
+            pipeline.optional_checkpoint()
+
+        with patch.object(Pipeline, "analogs", expire):
+            first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+            result = self.settled(first)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["result_status"], "ready")
+        self.assertEqual(result["steps"]["analogs"]["code"], "time_limit")
+        self.assertTrue(result["retry"]["allowed"])
+        path = "/api/papers/" + first["paper_id"]
+        saved = self.call(path)["profile"]
+        self.assertTrue(saved["content"]["summary"])
+        self.assertEqual(len(self.requests), 1)
+        resumed = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(resumed["status"], "completed", resumed["error"])
+        self.assertEqual(resumed["parent_job_id"], first["id"])
+        self.assertEqual(resumed["api_usage"]["calls"], 1)
+        self.assertEqual(self.resolutions, [FOCAL])
+        self.assertEqual(self.downloads.count(f"/pdf/{FOCAL}v3"), 1)
+        final = self.call(path)["profile"]
+        self.assertEqual(final["content"]["summary"], saved["content"]["summary"])
+        self.assertNotEqual(final["revision"], saved["revision"])
+        with self.assertRaises(HTTPError) as stale:
+            self.call(path + "/article.pdf?snapshot=" + saved["revision"], raw=True)
+        self.assertEqual(stale.exception.code, 409)
+
+    def test_core_visible_before_optional_work_and_cancel_keeps_it(self):
+        arrived, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+
+        def wait(pipeline):
+            arrived.set()
+            release.wait(6)
+            pipeline.alive()
+
+        with patch.object(Pipeline, "analogs", wait):
+            first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+            self.assertTrue(arrived.wait(6))
+            path = "/api/papers/" + first["paper_id"]
+            core = self.call(path)["profile"]
+            self.assertTrue(core["content"]["summary"])
+            self.call("/api/jobs/" + first["id"] + "/cancel", {})
+            release.set()
+            time.sleep(.1)
+        stopped = self.call("/api/jobs/" + first["id"])
+        self.assertEqual(stopped["status"], "cancelled")
+        self.assertTrue(stopped["retry"]["allowed"])
+        self.assertEqual(self.call(path)["profile"]["revision"], core["revision"])
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(self.source_downloads, [])
+
+    def test_reanalysis_reuses_pdf_and_document_with_isolated_settings(self):
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        original = self.call(path)["profile"]
+        downloads, resolutions = list(self.downloads), list(self.resolutions)
+        with patch("research.extract_pdf", side_effect=AssertionError("must use extraction cache")), \
+                patch("pipeline.extract_pdf", side_effect=AssertionError("must use extraction cache")):
+            repeated = self.settled(self.call(path + "/reanalyze", {"questions": "Что измерено?", "depth": "deep",
+                "settings": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "max_api_calls": 1}}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(repeated["operation"], "reanalyze")
+        self.assertEqual(repeated["api_usage"]["calls"], 1)
+        self.assertEqual(self.downloads, downloads)
+        self.assertEqual(self.resolutions, resolutions)
+        self.assertEqual(self.requests[-1]["reasoning"], {"effort": "high"})
+        self.assertEqual(self.call("/api/settings")["model"], "gpt-6-luna")
+        final = self.call(path)["profile"]
+        self.assertNotEqual(final["revision"], original["revision"])
+        self.assertEqual(final["article"]["sha256"], original["article"]["sha256"])
+        self.assertEqual(final["content"]["answers"][0]["sources"][0]["evidence"], QUOTE)
+        self.assertEqual(final["coverage"]["selection"]["budget_chars"], 48000)
+
+    def test_failed_reanalysis_keeps_old_profile_and_retry_repeats_model(self):
+        first = self.uploaded(pdf_bytes("Stable profile"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        before = self.call(path)["profile"]
+        self.fail_model = True
+        failed = self.settled(self.call(path + "/reanalyze", {"questions": "Что измерено?"}))
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(self.call(path)["profile"], before)
+        self.fail_model = False
+        count = len(self.requests)
+        repeated = self.settled(self.call("/api/jobs/" + failed["id"] + "/retry", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(self.requests[count]["text"]["format"]["name"], "article_profile")
+        self.assertEqual(self.call(path)["profile"]["questions"], "Что измерено?")
+
+    def test_retry_first_failure_uses_downloaded_materials_and_blank_is_blocked(self):
+        self.fail_model = True
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "failed")
+        before = list(self.downloads)
+        self.fail_model = False
+        repeated = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(self.downloads[:len(before)], before)
+        self.assertEqual(self.downloads.count(f"/pdf/{FOCAL}v3"), 1)
+        blank = self.settled(self.uploaded(pdf_bytes("No text", blank=True)))
+        self.assertEqual(blank["result_status"], "partial")
+        self.assertFalse(blank["retry"]["allowed"])
+        with self.assertRaises(HTTPError) as denied:
+            self.call("/api/jobs/" + blank["id"] + "/retry", {})
+        self.assertEqual(denied.exception.code, 400)
+
+    def test_catalog_and_effort_validation_do_not_call_inference(self):
+        catalog = self.call("/api/models/refresh", {})
+        known = {item["id"]: item for item in catalog["models"]}
+        self.assertTrue(known["gpt-6-luna"]["available"])
+        self.assertFalse(known["gpt-6-astra"]["available"])
+        self.assertIn("text-embedding-3-small", catalog["other_models"])
+        self.assertEqual(self.requests, [])
+        with self.assertRaises(HTTPError) as invalid:
+            self.call("/api/settings", {"model": "gpt-6-astra", "reasoning_effort": "none"})
+        self.assertEqual(invalid.exception.code, 400)
+        self.call("/api/settings", {"model": "custom-model", "reasoning_effort": "auto"})
+        self.fail_catalog = True
+        self.server.worker.catalog.last_attempt = 0
+        failed = self.call("/api/models/refresh", {})
+        self.assertIsNotNone(failed["error"])
+        self.assertFalse(failed["availability_checked"])
+        self.assertEqual(self.requests, [])
+
+    def test_stale_extraction_cache_is_rebuilt_and_tampered_pdf_is_rejected(self):
+        first = self.uploaded(pdf_bytes("Cache fixture"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        folder = Path(self.call(path)["directory"])
+        cache = json.loads((folder / "document.json").read_text(encoding="utf-8"))
+        cache["parser"] = "old-parser"
+        (folder / "document.json").write_text(json.dumps(cache), encoding="utf-8")
+        from research import extract_pdf
+        with patch("research.extract_pdf", wraps=extract_pdf) as extractor:
+            repeated = self.settled(self.call(path + "/reanalyze", {"settings": {"max_api_calls": 1}}))
+            self.assertEqual(repeated["status"], "completed", repeated["error"])
+            self.assertEqual(extractor.call_count, 1)
+        (folder / "article.pdf").write_bytes(pdf_bytes("Changed content"))
+        with self.assertRaises(HTTPError) as tampered:
+            self.call(path + "/reanalyze", {})
+        self.assertEqual(tampered.exception.code, 400)
+
+    def test_same_version_refresh_keeps_continuation_of_missing_analogs(self):
+        self.call("/api/settings", {"max_api_calls": 1})
+        first = self.call("/api/jobs", {"source": FOCAL, "mode": "research"})
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        refreshed = self.settled(self.call(path + "/refresh", {}))
+        self.assertEqual(refreshed["api_usage"]["calls"], 0)
+        paper = self.call(path)
+        self.assertEqual(paper["continuation_job"]["id"], first["id"])
+        resumed = self.settled(self.call("/api/jobs/" + first["id"] + "/retry", {}))
+        self.assertEqual(resumed["api_usage"]["calls"], 1)
+        self.assertFalse(resumed["retry"]["allowed"])
+
+    def test_cancelled_queued_reanalysis_can_be_continued(self):
+        first = self.uploaded(pdf_bytes("Queued continuation"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        self.server.worker.stop.set()
+        self.server.worker.thread.join(5)
+        path = "/api/papers/" + first["paper_id"]
+        queued = self.call(path + "/reanalyze", {})
+        self.assertEqual(queued["status"], "queued")
+        stopped = self.call("/api/jobs/" + queued["id"] + "/cancel", {})
+        self.assertTrue(stopped["retry"]["allowed"])
+        resumed = self.call("/api/jobs/" + queued["id"] + "/retry", {})
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["input_revision"], queued["input_revision"])
+
+    def test_new_job_can_override_model_and_effort_without_changing_defaults(self):
+        first = self.uploaded(pdf_bytes("Per article model"), settings={"model": "gpt-6.1-sol", "reasoning_effort": "high", "max_api_calls": 1})
+        result = self.settled(first)
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["settings"]["model"], "gpt-6.1-sol")
+        self.assertEqual(self.requests[0]["reasoning"], {"effort": "high"})
+        self.assertEqual(self.call("/api/settings")["model"], "gpt-6-luna")
+        self.assertEqual(self.call("/api/settings")["reasoning_effort"], "low")
+        count = len(self.requests)
+        second = self.uploaded(pdf_bytes("Default article model"))
+        self.assertEqual(self.settled(second)["status"], "completed")
+        self.assertEqual(self.requests[count]["model"], "gpt-6-luna")
+        self.assertEqual(self.requests[count]["reasoning"], {"effort": "low"})
+
+    def test_reference_title_lookup_is_separate_and_preserves_overview(self):
+        first = self.uploaded(pdf_bytes("Reference lookup"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        paper = self.call(path)
+        profile = paper["profile"]
+        original_summary = profile["content"]["summary"][:]
+        entry = profile["content"]["references"][2]
+        for key in ("title", "resolved_record", "publisher_url", "publication"):
+            entry.pop(key, None)
+        entry["dois"], entry["url"] = [], ""
+        store = self.server.store
+        with store.lock:
+            store.materials.publish(first["source"], store.materials.read(first["source"], "article.pdf"),
+                                    store.materials.read_text(first["source"]), profile)
+        count, downloads = len(self.requests), list(self.downloads)
+        repeated = self.settled(self.call(path + "/references", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(repeated["operation"], "references")
+        self.assertEqual(repeated["api_usage"]["calls"], 1)
+        self.assertEqual(self.requests[count]["text"]["format"]["name"], "reference_titles")
+        final = self.call(path)["profile"]
+        self.assertEqual(final["content"]["summary"], original_summary)
+        self.assertEqual(final["content"]["references"][2]["title"], "Power spectrum of light scattered by two-level systems")
+        self.assertEqual(final["content"]["references"][2]["url"], PUBLISHER)
+        self.assertEqual(self.downloads, downloads)
+
+    def test_title_resolution_survives_timeout_after_partial_progress(self):
+        def resolve(publications, http, references, on_update):
+            references[0]["title"] = "Confirmed title from metadata"
+            references[0]["url"] = "https://doi.org/10.1234/confirmed"
+            on_update()
+            raise StepExpired()
+
+        with patch("pipeline.resolve_reference_titles", side_effect=resolve):
+            job = self.uploaded(pdf_bytes("Partial references"), settings={"max_api_calls": 1})
+            result = self.settled(job)
+        self.assertEqual(result["status"], "completed")
+        final = self.call("/api/papers/" + job["paper_id"])["profile"]
+        self.assertEqual(final["content"]["references"][0]["title"], "Confirmed title from metadata")
+        self.assertEqual(final["steps"]["references"]["code"], "time_limit")
+
 
 class StorageTest(TempTest):
+    def test_legacy_numbered_references_repair_wraps_without_losing_metadata(self):
+        old = {"number": "1", "page": 1, "text": "A. Reader, Superconduc- tivity, Journal of Tests, 2020.",
+               "title": "Superconductivity", "arxiv_ids": [], "dois": ["10.1234/saved"],
+               "url": "https://doi.org/10.1234/saved", "citations": []}
+        _, _, paper_id, _ = self._save_old_profile(
+            ["Introduction\nSuperconductivity was observed [1].\nReferences\n[1] A. Reader, Superconduc-\ntivity, Journal of Tests, 2020."],
+            schema_version=3, references=[old])
+        store = Store(self.temp)
+        self.addCleanup(store.db.close)
+        recovered = store.paper(paper_id)["profile"]["content"]["references"][0]
+        self.assertIn("Superconductivity", recovered["text"])
+        self.assertNotIn("Superconduc-", recovered["text"])
+        self.assertEqual(recovered["title"], "Superconductivity")
+        self.assertEqual(recovered["url"], old["url"])
+
+    def test_bibliography_upgrade_keeps_previously_verified_answers(self):
+        library, source, paper_id, pdf = self._save_old_profile(["References\n[1] " + MOLLOW], schema_version=6)
+        profile = library.profile(source)
+        support = {"evidence": QUOTE, "page": 1, "section": "Результаты", "location": "Страница 1"}
+        profile["content"]["answers"] = [{"question": "Что измерено?", "answer": "4 дБ", "status": "answered", "sources": [support]},
+                                           {"question": "Старый ответ?", "answer": "Ответ", "status": "answered"}]
+        library.publish(source, pdf, library.read_text(source), profile)
+        store = Store(self.temp)
+        self.addCleanup(store.db.close)
+        answers = store.paper(paper_id)["profile"]["content"]["answers"]
+        self.assertEqual(answers[0]["status"], "answered")
+        self.assertEqual(answers[0]["sources"], [support])
+        self.assertEqual(answers[1]["status"], "unverified")
+
     def _save_old_profile(self, pages, *, schema_version, references=None):
         with closing(Store(self.temp).db) as db:
             store_source = "arxiv:" + FOCAL
@@ -574,7 +857,7 @@ class StorageTest(TempTest):
             self.assertIn("Библиография", upgraded["profile"]["coverage"]["sections"])
             self.assertEqual(upgraded["profile"]["coverage"]["notes"], [])
             self.assertEqual(store.jobs(), [])
-            self.assertIn("**Physical Review 188, 1969**  \n  B. R. Mollow  \n  (1969)",
+            self.assertIn("**Название не установлено**  \n  B. R. Mollow",
                           (library.folder(store_source) / "profile.md").read_text(encoding="utf-8"))
             self.assertEqual(library.read(store_source, "article.pdf"), pdf)
 
@@ -602,6 +885,45 @@ class StorageTest(TempTest):
             self.assertIn("A different paper", library.read(source, "profile.md").decode())
             self.assertEqual(library.read(source, "article.pdf"), pdf)
             self.assertEqual(store.jobs(), [])
+
+    def test_upgrade_rebuilds_repeated_citations_in_saved_profile(self):
+        reference = {"number": "1", "page": 1, "text": MOLLOW, "arxiv_ids": [], "dois": ["10.1234/saved"],
+                     "url": "https://doi.org/10.1234/saved", "title": "Verified title",
+                     "citations": [{"page": 1, "section": "Введение"}]}
+        pages = ["Introduction\nFirst [1]. Second [1].\nReferences\n[1] " + MOLLOW]
+        library, source, paper_id, pdf = self._save_old_profile(pages, schema_version=7, references=[reference])
+        store = Store(self.temp)
+        with closing(store.db):
+            profile = store.paper(paper_id)["profile"]
+            updated, = profile["content"]["references"]
+            first, second = updated["citations"]
+            self.assertEqual((first["page"], second["page"]), (1, 1))
+            self.assertNotEqual(first["anchor"], second["anchor"])
+            self.assertEqual(updated["title"], reference["title"])
+            self.assertEqual(updated["url"], reference["url"])
+            self.assertEqual(profile["revision"], "original")
+            self.assertEqual(library.read(source, "article.pdf"), pdf)
+            self.assertEqual(store.jobs(), [])
+
+    def test_upgrade_recovers_alpha_bibliography_without_new_job(self):
+        pages = ["Introduction\nFirst [AA20; Ber26a]. Again [AA20].\n"
+                 "References\n[AA20] Alice Reader. First paper, 2020.\n[Ber26a] Bob Writer. Second paper,\n2026."]
+        merged = {"number": "", "page": 1, "text": "[AA20] Alice Reader. First paper, 2020. [Ber26a] Bob Writer. Second paper, 2026.",
+                  "arxiv_ids": [], "dois": [], "url": "", "citations": []}
+        library, source, paper_id, pdf = self._save_old_profile(pages, schema_version=8, references=[merged])
+        original = library.profile(source)
+        original["content"]["summary"] = ["Previously saved overview."]
+        library.publish(source, pdf, library.read_text(source), original)
+        with patch("publications.Http.read", side_effect=AssertionError("Migration must be local")), closing(Store(self.temp).db) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+        recovered = library.profile(source)
+        refs = recovered["content"]["references"]
+        self.assertEqual([ref["number"] for ref in refs], ["AA20", "Ber26a"])
+        self.assertEqual([len(ref["citations"]) for ref in refs], [2, 1])
+        self.assertEqual(recovered["content"]["summary"], original["content"]["summary"])
+        self.assertEqual(recovered["usage"], original["usage"])
+        self.assertEqual(library.read(source, "article.pdf"), pdf)
+        self.assertIn(r"\[Ber26a\]", library.read(source, "profile.md").decode())
 
     def test_recover_interrupted_file_replacement(self):
         library = MaterialLibrary(self.temp / "Materials")
@@ -714,16 +1036,41 @@ class ParsingTest(unittest.TestCase):
 
     def test_citations_track_main_text_pages_and_expand_groups(self):
         pages = [
-            "Introduction\nEarlier work [1, 3–4]. Another mention of [4].",
+            "Introduction\nEarlier work [1, 3–4, 4]. Another mention of [4]. Take γ∈[0,1].",
             "Methods\nWe follow [2; 4].",
-            "References\n[1] Reference one.\n[2] Reference two.\n[3] Reference three.\n[4] Reference four.",
+            "Appendix A\nWe cite [2].\nReferences\n[1] Reference one.\n[2] Reference two.\n[3] Reference three.\n[4] Reference four.",
             "Supplemental Material\nWe also use [1].",
         ]
         entries = bibliography(split_sections(pages))
-        introduction = {"page": 1, "section": "Введение"}
-        methods = {"page": 2, "section": "Методы"}
-        self.assertEqual([entry["citations"] for entry in entries],
-                         [[introduction], [methods], [introduction], [introduction, methods]])
+        introduction, methods, appendix = (1, "Введение"), (2, "Методы"), (3, "Приложение")
+        locations = [[(c["page"], c["section"]) for c in entry["citations"]] for entry in entries]
+        self.assertEqual(locations, [[introduction], [methods, appendix], [introduction], [introduction, introduction, methods]])
+        self.assertEqual(len({c["anchor"] for c in entries[3]["citations"]}), 3)
+
+    def test_author_year_citations_in_brackets_and_narrative(self):
+        pages = ["Introduction\nEarlier work [Bender and Klein, 2021]. Results.Bender and Klein [2021] extended it. "
+                 "Ortiz et al. [2022] report another result.\nReferences\n"
+                 "Laura Bender and Martin Klein. A sample paper. Journal of Tests, 2021.\n"
+                 "Maya Ortiz, Morgan Reed, and Li Chen. A follow-up. November 2022. URLhttps://example.org/paper."]
+        first, second = bibliography(split_sections(pages))
+        self.assertEqual(len(first["citations"]), 2)
+        self.assertEqual(len(second["citations"]), 1)
+
+    def test_rmp_style_entries_and_citations_with_multiple_years(self):
+        pages = ["Introduction\nWolf and Born (2012, 2013a). Again (Wolf and Born, 2013a; Perez et al., 2009). "
+                 "Perez, Fox, and Fink (2009). Perez and Bell (2009). Wallraﬀ (2008).",
+                 'References\nPerez, P., T.\nFox, and R. Fink, 2009, Phys. Rev. A 99, 1234.\n'
+                 'Perez, P., and S. Bell, 2009, Phys. Rev. A 99, 2345.\n'
+                 'Wallraﬀ, E., 2008, Topics in Physics:\nAtoms, Cavities, and Photons, vol\n191. (Publisher, City).\n'
+                 'Wolf, S., and R. Born, 2012, Phys. Rev. A 80, 100.\n'
+                 'Wolf, S., and R. Born,',
+                 '4\n2013a, “An example,” Phys. Rev. A 81, 101.\n'
+                 'Wolf, S., and R. Born, 2013b, Phys. Rev. A 81, 102.']
+        entries = bibliography(split_sections(pages))
+        self.assertEqual([len(entry["citations"]) for entry in entries], [1, 1, 1, 1, 2, 0])
+        self.assertIn("191. (Publisher, City)", entries[2]["text"])
+        self.assertEqual(_reference_item(entries[4])["label"], "An example")
+        self.assertEqual(_reference_item(entries[4])["text"], "Phys. Rev. A 81, 101 (2013)")
 
     def test_unnamed_bibliography_can_start_early_and_ends_before_supplement(self):
         pages = ["[1] Step one\n[2] Step two\n[3] Step three",

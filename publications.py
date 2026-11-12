@@ -16,6 +16,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from manuscripts import SOURCE_LIMIT
+from model_catalog import validate_effort
 from materials import PDF_LIMIT, arxiv_id, clean_text, compact, web_link
 from version import VERSION
 
@@ -31,11 +32,12 @@ ARXIV_QUERY_INTERVAL = 3.05
 
 
 class ServiceError(RuntimeError):
-    def __init__(self, message, status=None, *, retry_after=None, deferred=False):
+    def __init__(self, message, status=None, *, retry_after=None, deferred=False, code=""):
         super().__init__(message)
         self.status = status
         self.retry_after = retry_after
         self.deferred = deferred
+        self.code = code
 
 
 def retry_delay(value):
@@ -78,15 +80,29 @@ class Http:
                     if len(result) > limit:
                         raise ServiceError(f"{service}: ответ превышает допустимый размер.")
         except HTTPError as exc:
+            error_code = ""
+            if service == "OpenAI":
+                try:
+                    detail = json.loads(exc.read(4096)).get("error")
+                    if isinstance(detail, dict) and detail.get("code") in {
+                            "insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
+                            "rate_limit_exceeded", "model_not_found", "invalid_api_key"}:
+                        error_code = detail["code"]
+                except (ValueError, UnicodeError, OSError, HTTPException, AttributeError):
+                    pass
             exc.close()
             self.checkpoint()
             if service == "OpenAI":
                 hint = {401: " Проверьте ключ API.", 403: " Проверьте права доступа.",
                         429: " Достигнут лимит запросов или средств."}.get(exc.code, "")
+                if error_code in {"insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached"}:
+                    hint = " Недостаточно средств или исчерпана квота API. Проверьте биллинг OpenAI перед повтором."
+                elif error_code == "rate_limit_exceeded":
+                    hint = " Превышена частота запросов. Повторите позже."
             else:
                 hint = " Сервис ограничил число запросов." if exc.code == 429 else ""
             delay = retry_delay(exc.headers.get("Retry-After")) if exc.headers and exc.code == 429 else None
-            raise ServiceError(f"{service}: HTTP {exc.code}.{hint}", status=exc.code, retry_after=delay) from None
+            raise ServiceError(f"{service}: HTTP {exc.code}.{hint}", status=exc.code, retry_after=delay, code=error_code) from None
         except (URLError, OSError, HTTPException):
             self.checkpoint()
             raise ServiceError(f"{service}: не удалось получить ответ. Проверьте сеть и повторите вручную.") from None
@@ -179,12 +195,36 @@ def parse_arxiv_page(raw, base):
             "doi": doi(meta.first("citation_doi")), "url": arxiv_url(base, version), "source": "arXiv"}
 
 
+def metadata_title(value):
+    """Crossref titles can contain MathML/JATS; expose readable text, not XML tags."""
+    value = html.unescape(str(value or ""))
+    if not re.search(r"</?[A-Za-z]", value):
+        return compact(value, 500)
+    try:
+        root = ET.fromstring("<title>" + value + "</title>")
+    except ET.ParseError:
+        return compact(re.sub(r"<[^>]*>", "", value), 500)
+
+    def render(node):
+        name = node.tag.rsplit("}", 1)[-1].split(":")[-1]
+        if name in {"msup", "msub"} and len(node) == 2:
+            base, script = render(node[0]), render(node[1])
+            normal = "0123456789+-=()"
+            symbols = "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾" if name == "msup" else "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"
+            return base + (script.translate(str.maketrans(normal, symbols)) if all(char in normal for char in script)
+                           else ("^{" if name == "msup" else "_{") + script + "}")
+        content = (node.text or "") + "".join(render(child) + (child.tail or "") for child in node)
+        return (" " if name == "math" else "") + content
+
+    return compact(render(root), 500)
+
+
 def crossref_record(record):
     if not isinstance(record, dict):
         return None
     identifier = doi(record.get("DOI"))
     titles = record.get("title") or []
-    title = compact(titles[0], 500) if isinstance(titles, list) else ""
+    title = metadata_title(titles[0]) if isinstance(titles, list) and titles else ""
     if not identifier or not title:
         return None
     dates = (record.get("published") or {}).get("date-parts") or []
@@ -193,11 +233,14 @@ def crossref_record(record):
     resource = record.get("resource") or {}
     primary = resource.get("primary", {}) if isinstance(resource, dict) else {}
     publisher_url = web_link(primary.get("URL")) if isinstance(primary, dict) else ""
+    pdf_url = next((url for link in record.get("link") or [] if isinstance(link, dict)
+                    and str(link.get("content-type", "")).casefold() == "application/pdf"
+                    and (url := web_link(link.get("URL")))), "")
     return {"arxiv_id": "", "version": "", "doi": identifier, "title": title, "published": date,
             "authors": [compact(f'{a.get("given", "")} {a.get("family", "")}', 200)
                         for a in (record.get("author") or [])[:50] if isinstance(a, dict)],
             "abstract": compact(html.unescape(re.sub(r"<[^>]*>", " ", str(record.get("abstract") or ""))), 6000),
-            "url": doi_url(identifier), "publisher_url": publisher_url, "source": "Crossref",
+            "url": doi_url(identifier), "publisher_url": publisher_url, "pdf_url": pdf_url, "source": "Crossref",
             "publication": {"journal": compact(journals[0], 300) if isinstance(journals, list) and journals else "",
                             "volume": compact(record.get("volume"), 30), "issue": compact(record.get("issue"), 30),
                             "pages": compact(record.get("page") or record.get("article-number"), 80), "year": date[:4]}}
@@ -222,6 +265,20 @@ def _matches_citation(text, entry, work):
     year = work["published"][:4]
     if not (volume and page and year):
         return False
+    escaped_volume, escaped_page, escaped_year = map(re.escape, (volume, page, year))
+    coordinates = re.search(rf" (?:{escaped_volume}(?: \d{{1,3}})? {escaped_page} {escaped_year}|"
+                            rf"{escaped_volume} {escaped_year} {escaped_page}|"
+                            rf"{escaped_year} {escaped_volume}(?: \d{{1,3}})? {escaped_page}) ", text)
+    if coordinates:
+        before = text[:coordinates.start()].split()[-8:]
+        for key in ("container-title", "short-container-title"):
+            for name in entry.get(key) or []:
+                terms = [word for word in _citation_words(name).split() if word not in {"of", "the", "and"}]
+                for offset in range(len(before)):
+                    tail = [word for word in before[offset:] if word not in {"of", "the", "and"}]
+                    if terms and len(tail) >= len(terms) and all(
+                            left.startswith(right) or right.startswith(left) for left, right in zip(terms, tail)):
+                        return True
     for key in ("container-title", "short-container-title"):
         for name in entry.get(key) or []:
             journal = _citation_words(name)
@@ -297,10 +354,10 @@ class Publications:
             raise ServiceError("Crossref: неожиданный формат результатов поиска.")
         return message["items"]
 
-    def crossref_citation(self, http, citation):
-        fields = "container-title,short-container-title,volume,issue,page,article-number,resource"
+    def crossref_citation(self, http, citation, query=None):
+        fields = "container-title,short-container-title,volume,issue,page,article-number,resource,link"
         text = " " + _citation_words(citation) + " "
-        matches = {work["doi"]: work for entry in self._crossref_items(http, compact(citation, 600), 3, fields)
+        matches = {work["doi"]: work for entry in self._crossref_items(http, compact(query or citation, 600), 3, fields)
                    if (work := crossref_record(entry)) and _matches_citation(text, entry, work)}
         return next(iter(matches.values())) if len(matches) == 1 else None
 
@@ -315,7 +372,7 @@ def object_schema(**properties):
 
 
 STRING = {"type": "string"}
-KIND = {"type": "string", "enum": ["measurement", "calculation", "interpretation", "other"]}
+KIND = {"type": "string", "enum": ["measurement", "calculation", "simulation", "data_analysis", "interpretation", "other"]}
 
 
 def array(items):
@@ -325,14 +382,17 @@ def array(items):
 PROFILE_SCHEMA = object_schema(
     summary=array(STRING),
     answers=array(object_schema(question_id=STRING, answer=STRING,
-                                status={"type": "string", "enum": ["answered", "insufficient"]})),
+                                status={"type": "string", "enum": ["answered", "insufficient"]},
+                                sources=array(object_schema(snippet=STRING, evidence=STRING)))),
     glossary=array(object_schema(term=STRING, explanation=STRING, role=STRING)),
     keywords=array(object_schema(term=STRING, importance={"type": "integer"}, role=STRING)),
     topics=array(STRING),
     claims=array(object_schema(statement=STRING, kind=KIND, snippet=STRING, evidence=STRING, locator=STRING,
                                 check=STRING, explanation=STRING)),
     search_terms=array(STRING),
+    reference_hints=array(object_schema(reference_id=STRING, title=STRING, evidence=STRING, search_query=STRING)),
 )
+REFERENCE_SCHEMA = object_schema(reference_hints=PROFILE_SCHEMA["properties"]["reference_hints"])
 ANALOG_SCHEMA = object_schema(
     analogs=array(object_schema(candidate_id=STRING, similarity=STRING, difference=STRING,
                                  snippet=STRING)),
@@ -356,11 +416,13 @@ class Model:
             "max_output_tokens": self.settings["max_output_tokens"],
             "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
         }
-        if payload["model"] == "gpt-6-luna":
-            payload["reasoning"] = {"effort": "low"}
+        effort = self.settings.get("reasoning_effort", "auto")
+        validate_effort(payload["model"], effort)
+        if effort != "auto":
+            payload["reasoning"] = {"effort": effort}
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(raw) > MAX_PROMPT_BYTES:
-            raise ServiceError("Запрос к модели превышает установленный предел входных данных.")
+            raise ServiceError("Запрос к модели слишком велик. Выберите меньший охват текста и запустите разбор заново.")
         self.http.checkpoint()
         self.start_call()
         response = self.http.json(RESPONSES, "OpenAI", data=raw, timeout=75,
@@ -385,4 +447,22 @@ class Model:
             raise ServiceError("Модель вернула нечитаемые структурированные данные.") from None
         if not isinstance(value, dict):
             raise ServiceError("Модель вернула неожиданный формат профиля.")
+        validate_output(value, schema)
         return value
+
+
+def validate_output(value, schema):
+    """Validate the small schema subset used by both requests before consuming a result."""
+    expected = schema["type"]
+    valid = {"object": isinstance(value, dict), "array": isinstance(value, list),
+             "string": isinstance(value, str), "integer": type(value) is int}.get(expected, False)
+    if not valid or "enum" in schema and value not in schema["enum"]:
+        raise ServiceError("Модель вернула данные, не соответствующие схеме результата.")
+    if expected == "object":
+        if set(value) != set(schema["properties"]):
+            raise ServiceError("Модель вернула неполный или неизвестный набор полей.")
+        for key, child in schema["properties"].items():
+            validate_output(value[key], child)
+    elif expected == "array":
+        for child in value:
+            validate_output(child, schema["items"])
