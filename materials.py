@@ -12,7 +12,7 @@ import time
 from html import escape
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 
 from manuscripts import SOURCE_FILES
 from bibliographic import reference_text
@@ -22,7 +22,7 @@ PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
 MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
-PROFILE_VERSION = 7
+PROFILE_VERSION = 8
 EXTRACTION_VERSION = 1
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
@@ -31,6 +31,14 @@ SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) materials?|допол�
 LETTERED_APPENDIX_HEADING = re.compile(r"^A\s+[A-Z][^\s,.;]*\s+[^,.;]{1,140}$")
 BIBLIOGRAPHIC_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
 AUTHOR_YEAR_START = re.compile(rf"^[^\W\d_][^,\d]{{0,59}},\s+(?:[^\W\d_]\.\s*)+[^()]{{0,220}}\({BIBLIOGRAPHIC_YEAR}\)\.")
+RMP_SURNAME = r"^(?P<surname>[^\W\d_][^,.\d()]{0,59}),\s+"
+RMP_INITIALS = r"(?:[^\W\d_]\.\s*(?:-\s*[^\W\d_]\.\s*)?)+"
+RMP_REFERENCE_LEAD = re.compile(rf"{RMP_SURNAME}{RMP_INITIALS},")
+RMP_REFERENCE_START = re.compile(rf"{RMP_SURNAME}(?:{RMP_INITIALS}|[A-Z][^,.\d()]{{1,50}}),"
+                                 rf"\s*(?:(?P<coauthors>[^\d]{{1,1000}}?),\s*)?"
+                                 rf"(?P<year>{BIBLIOGRAPHIC_YEAR}),\s*")
+RMP_TITLE = re.compile(r'[“"]([^”"]+)[”"],?\s*')
+CITATION_ANCHOR = r"[0-9]{1,6}-[0-9]{1,6}-[0-9]{1,6}"
 REFERENCE_YEAR_END = re.compile(rf"\b{BIBLIOGRAPHIC_YEAR}(?:[)\]]\.?|\.)$")
 DISPLAY_YEAR = re.compile(rf"\((?P<parenthesized>{BIBLIOGRAPHIC_YEAR})\)|(?<![\w.])(?P<trailing>{BIBLIOGRAPHIC_YEAR})(?=\s*[)\]]?\.?\s*$)")
 ABSTRACT_HEADING = re.compile(r"^(?:abstract|аннотация)\s*[:.—–-]\s*(\S.*)$", re.I)
@@ -231,12 +239,14 @@ def split_sections(pages):
     parts = []
     section = "Основной текст"
     appended_supplement = False
+    separate_supplement = False
     last_reference_line = ""
     for page, text in enumerate(pages, start=1):
         lines = []
         page_lines = text.splitlines()
         if appended_supplement:
-            parts.append({"section": "Приложение", "page": page, "text": text})
+            parts.append({"section": "Приложение", "page": page, "text": text,
+                          "separate_supplement": separate_supplement})
             continue
         next_page = pages[page].splitlines() if page < len(pages) else []
         reference_start = _reference_start(page_lines, next_page) if section != "Библиография" else None
@@ -258,6 +268,7 @@ def split_sections(pages):
                 heading = "Приложение"
             if heading == "Приложение" and section == "Библиография":
                 appended_supplement = True
+                separate_supplement = bool(supplement)
             if index == reference_start:
                 heading = "Библиография"
             if section == "Приложение" and heading != "Библиография":
@@ -276,7 +287,10 @@ def split_sections(pages):
             if section == "Библиография" and line and not line.isdecimal():
                 last_reference_line = line
         if lines:
-            parts.append({"section": section, "page": page, "text": "\n".join(lines)})
+            part = {"section": section, "page": page, "text": "\n".join(lines)}
+            if separate_supplement:
+                part["separate_supplement"] = True
+            parts.append(part)
     return parts
 
 
@@ -297,7 +311,8 @@ def document_text(document):
 
 
 def saved_pages(text):
-    return re.split(r"^--- Страница \d+ ---\n", text, flags=re.M)[1:]
+    pages = re.split(r"^--- Страница \d+ ---\n", text, flags=re.M)[1:]
+    return ["" if page == "[Текст не извлечён]" else page for page in map(str.strip, pages)]
 
 
 def material_name(source):
@@ -467,7 +482,16 @@ def _reference_item(entry):
     year = ""
     author_year = (AUTHOR_YEAR_START.match(entry["text"])
                    if not re.match(r"^(?:and\s+)?[A-ZА-ЯЁ]\.", entry["text"]) else None)
-    if author_year:
+    rmp = RMP_REFERENCE_START.match(entry["text"]) if not entry["number"] else None
+    if rmp:
+        authors = entry["text"][:rmp.start("year")].rstrip(" ,")
+        year = rmp["year"][:4]
+        details = entry["text"][rmp.end():]
+        quoted = RMP_TITLE.match(details)
+        title = quoted[1].rstrip(",") if quoted else ""
+        if quoted:
+            details = details[quoted.end():]
+    elif author_year:
         authors, year = author_year[0].rsplit("(", 1)
         authors, year = authors.strip(" ,"), year[:4]
         title, _, details = entry["text"][author_year.end():].strip().partition(". ")
@@ -498,7 +522,8 @@ def _reference_item(entry):
     for location in entry.get("citations", []):
         page, section = location["page"], location["section"]
         label_suffix = f" · {section}" if section != "Основной текст" else ""
-        citations.append({"page": page, "label": f"с. {page}{label_suffix}"})
+        citations.append({"page": page, "label": f"с. {page}{label_suffix}",
+                          "anchor": location.get("anchor", ""), "context": location.get("context", "")})
     return {"label": label, "text": " ".join(filter(None, (details, year))), "href": web_link(entry["url"]),
             "number": entry["number"], "authors": authors, "citations": citations, "missing_title": missing}
 
@@ -662,10 +687,12 @@ def _markdown_item(key, item):
             lines.append("  " + _markdown_text(item["authors"]))
         if item["text"]:
             lines.append("  " + _markdown_text(item["text"]))
-        if item["citations"]:
-            mentions = " · ".join(f'[{_markdown_text(place["label"])}](article.pdf#page={place["page"]})'
-                                  for place in item["citations"])
-            lines.append("  В тексте · " + mentions)
+        for place in item["citations"]:
+            fragment = f'page={place["page"]}'
+            if place["anchor"]:
+                fragment += "&citation=" + place["anchor"]
+            context = f' · {_markdown_text(place["context"])}' if place["context"] else ""
+            lines.append(f'  В тексте · [{_markdown_text(place["label"])}](article.pdf#{fragment}){context}')
         return [line + "  " for line in lines[:-1]] + lines[-1:]
     if item.get("details"):
         lines = ["- **" + label + "**"]
@@ -718,6 +745,11 @@ def render_markdown_preview(data, snapshot):
             for child in token.children or []:
                 if child.type == "link_open":
                     path, marker, fragment = child.attrGet("href").partition("#")
+                    citation = re.fullmatch(rf"page=\d+&citation=({CITATION_ANCHOR})", fragment)
+                    if path == "article.pdf" and citation:
+                        query = urlencode({"at": citation[1], "snapshot": snapshot})
+                        child.attrSet("href", f"citation.html?{query}#citation")
+                        continue
                     if path == "manuscript.tex":
                         path = "manuscript.html"
                         child.attrSet("href", path)
@@ -735,6 +767,36 @@ def render_markdown_preview(data, snapshot):
 <body><main class="profile-document">
   <p class="profile-document-version">Research Agent {VERSION}</p>
   {content}
+</main></body>
+</html>
+"""
+
+
+def render_citation_preview(data, anchor, snapshot):
+    if not re.fullmatch(CITATION_ANCHOR, anchor):
+        return None
+    index, start, end = map(int, anchor.split("-"))
+    pages = saved_pages(data.decode("utf-8-sig").replace("\r\n", "\n"))
+    parts = split_sections(pages)
+    if index >= len(parts) or not start < end <= len(parts[index]["text"]):
+        return None
+    part = parts[index]
+    text = part["text"]
+    before, citation, after = escape(text[:start]), escape(text[start:end]), escape(text[end:])
+    pdf = "article.pdf" + (f"?snapshot={quote(snapshot, safe='')}" if snapshot else "") + f'#page={part["page"]}'
+    location = f'Страница {part["page"]} · {part["section"]}'
+    return f"""<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Цитата в тексте · Research Agent</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body><main class="profile-document">
+  <h1>{escape(location)}</h1>
+  <p><a href="{escape(pdf)}">Открыть страницу PDF</a></p>
+  <pre class="citation-text">{before}<mark id="citation">{citation}</mark>{after}</pre>
 </main></body>
 </html>
 """

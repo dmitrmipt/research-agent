@@ -412,7 +412,9 @@ class ResearchTest(TempTest):
         self.assertEqual(references[2]["label"], "Power spectrum of light scattered by two-level systems")
         self.assertEqual(references[2]["authors"], "B. R. Mollow")
         self.assertEqual(references[2]["text"], "Physical Review 188, 1969-1975 (1969)")
-        self.assertEqual(references[2]["citations"], [{"page": 1, "label": "с. 1 · Введение"}])
+        citation, = references[2]["citations"]
+        self.assertEqual((citation["page"], citation["label"]), (1, "с. 1 · Введение"))
+        self.assertIn("Prior experiments are described in [1-3]", citation["context"])
         matches = {entry["title"]: entry for entry in content["analogs"]}
         self.assertIn("Cited apparatus", matches)
         self.assertIn("предварительно", matches["Journal comparison"]["basis"])
@@ -445,6 +447,17 @@ class ResearchTest(TempTest):
         self.assertIn("B. R. Mollow<br>", preview)
         self.assertNotIn("<strong>B. R. Mollow</strong>", preview)
         self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', preview)
+        at = citation["anchor"]
+        self.assertIn(f'href="citation.html?at={at}&amp;snapshot={revision}#citation"', preview)
+        source = self.call(f"{path}/citation.html?at={at}&snapshot={revision}", raw=True).decode()
+        self.assertIn('Prior experiments are described in <mark id="citation">[1-3]</mark>', source)
+        self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', source)
+        with self.assertRaises(HTTPError) as missing_citation:
+            self.call(f"{path}/citation.html?at=999-1-9&snapshot={revision}", raw=True)
+        self.assertEqual(missing_citation.exception.code, 404)
+        with self.assertRaises(HTTPError) as stale_citation:
+            self.call(f"{path}/citation.html?at={at}&snapshot=obsolete", raw=True)
+        self.assertEqual(stale_citation.exception.code, 409)
         self.assertIn(f'href="https://arxiv.org/pdf/{NEIGHBOR}v2#page=1"', preview)
 
         with (folder / "profile.md").open("a", encoding="utf-8") as saved:
@@ -873,6 +886,25 @@ class StorageTest(TempTest):
             self.assertEqual(library.read(source, "article.pdf"), pdf)
             self.assertEqual(store.jobs(), [])
 
+    def test_upgrade_rebuilds_repeated_citations_in_saved_profile(self):
+        reference = {"number": "1", "page": 1, "text": MOLLOW, "arxiv_ids": [], "dois": ["10.1234/saved"],
+                     "url": "https://doi.org/10.1234/saved", "title": "Verified title",
+                     "citations": [{"page": 1, "section": "Введение"}]}
+        pages = ["Introduction\nFirst [1]. Second [1].\nReferences\n[1] " + MOLLOW]
+        library, source, paper_id, pdf = self._save_old_profile(pages, schema_version=7, references=[reference])
+        store = Store(self.temp)
+        with closing(store.db):
+            profile = store.paper(paper_id)["profile"]
+            updated, = profile["content"]["references"]
+            first, second = updated["citations"]
+            self.assertEqual((first["page"], second["page"]), (1, 1))
+            self.assertNotEqual(first["anchor"], second["anchor"])
+            self.assertEqual(updated["title"], reference["title"])
+            self.assertEqual(updated["url"], reference["url"])
+            self.assertEqual(profile["revision"], "original")
+            self.assertEqual(library.read(source, "article.pdf"), pdf)
+            self.assertEqual(store.jobs(), [])
+
     def test_recover_interrupted_file_replacement(self):
         library = MaterialLibrary(self.temp / "Materials")
         source = "arxiv:" + FOCAL
@@ -984,16 +1016,41 @@ class ParsingTest(unittest.TestCase):
 
     def test_citations_track_main_text_pages_and_expand_groups(self):
         pages = [
-            "Introduction\nEarlier work [1, 3–4]. Another mention of [4].",
+            "Introduction\nEarlier work [1, 3–4, 4]. Another mention of [4]. Take γ∈[0,1].",
             "Methods\nWe follow [2; 4].",
-            "References\n[1] Reference one.\n[2] Reference two.\n[3] Reference three.\n[4] Reference four.",
+            "Appendix A\nWe cite [2].\nReferences\n[1] Reference one.\n[2] Reference two.\n[3] Reference three.\n[4] Reference four.",
             "Supplemental Material\nWe also use [1].",
         ]
         entries = bibliography(split_sections(pages))
-        introduction = {"page": 1, "section": "Введение"}
-        methods = {"page": 2, "section": "Методы"}
-        self.assertEqual([entry["citations"] for entry in entries],
-                         [[introduction], [methods], [introduction], [introduction, methods]])
+        introduction, methods, appendix = (1, "Введение"), (2, "Методы"), (3, "Приложение")
+        locations = [[(c["page"], c["section"]) for c in entry["citations"]] for entry in entries]
+        self.assertEqual(locations, [[introduction], [methods, appendix], [introduction], [introduction, introduction, methods]])
+        self.assertEqual(len({c["anchor"] for c in entries[3]["citations"]}), 3)
+
+    def test_author_year_citations_in_brackets_and_narrative(self):
+        pages = ["Introduction\nEarlier work [Bender and Klein, 2021]. Results.Bender and Klein [2021] extended it. "
+                 "Ortiz et al. [2022] report another result.\nReferences\n"
+                 "Laura Bender and Martin Klein. A sample paper. Journal of Tests, 2021.\n"
+                 "Maya Ortiz, Morgan Reed, and Li Chen. A follow-up. November 2022. URLhttps://example.org/paper."]
+        first, second = bibliography(split_sections(pages))
+        self.assertEqual(len(first["citations"]), 2)
+        self.assertEqual(len(second["citations"]), 1)
+
+    def test_rmp_style_entries_and_citations_with_multiple_years(self):
+        pages = ["Introduction\nWolf and Born (2012, 2013a). Again (Wolf and Born, 2013a; Perez et al., 2009). "
+                 "Perez, Fox, and Fink (2009). Perez and Bell (2009). Wallraﬀ (2008).",
+                 'References\nPerez, P., T.\nFox, and R. Fink, 2009, Phys. Rev. A 99, 1234.\n'
+                 'Perez, P., and S. Bell, 2009, Phys. Rev. A 99, 2345.\n'
+                 'Wallraﬀ, E., 2008, Topics in Physics:\nAtoms, Cavities, and Photons, vol\n191. (Publisher, City).\n'
+                 'Wolf, S., and R. Born, 2012, Phys. Rev. A 80, 100.\n'
+                 'Wolf, S., and R. Born,',
+                 '4\n2013a, “An example,” Phys. Rev. A 81, 101.\n'
+                 'Wolf, S., and R. Born, 2013b, Phys. Rev. A 81, 102.']
+        entries = bibliography(split_sections(pages))
+        self.assertEqual([len(entry["citations"]) for entry in entries], [1, 1, 1, 1, 2, 0])
+        self.assertIn("191. (Publisher, City)", entries[2]["text"])
+        self.assertEqual(_reference_item(entries[4])["label"], "An example")
+        self.assertEqual(_reference_item(entries[4])["text"], "Phys. Rev. A 81, 101 (2013)")
 
     def test_unnamed_bibliography_can_start_early_and_ends_before_supplement(self):
         pages = ["[1] Step one\n[2] Step two\n[3] Step three",

@@ -13,7 +13,7 @@ from manuscripts import select_manuscript
 from materials import EXTRACTION_VERSION, MaterialError, _reference_item, document_text, extract_pdf, extraction_signature, split_sections
 from publications import Http, Model, REFERENCE_SCHEMA, ServiceError
 from research import (ANALOGS_SKIPPED, LEGACY_SEARCH_NOTES, _bibliography_records, _enrich_references,
-                      REFERENCE_INSTRUCTIONS, apply_reference_hints, reference_inputs, resolve_reference_titles,
+                      REFERENCE_INSTRUCTIONS, apply_reference_hints, locate_citations, reference_inputs, resolve_reference_titles,
                       _ranked_references, prepare_profile, search_analogs)
 
 STEP_NAMES = {"material": "Получение и извлечение текста", "core": "Основной профиль",
@@ -102,6 +102,16 @@ class Pipeline:
         if document is not None:
             self.document = document
             self.step("material", "completed")
+
+    def restore_profile(self, current, cached):
+        self.profile = copy.deepcopy(current)
+        self.profile["article"] = cached["article"]
+        self.raw = cached["pdf"]
+        document = cached["document"]
+        if document is None:
+            document = extract_pdf(self.raw, self.checkpoint)
+            locate_citations(self.profile["content"].get("references", []), split_sections(document["pages"]))
+        self.save_material(self.raw, self.profile["article"], document)
 
     def publish(self, manuscript=None):
         # Publishing is local and has a reserved budget. Always honor explicit cancellation.
@@ -236,14 +246,9 @@ class Pipeline:
         if job["operation"] in ("analogs", "references") or resume_core:
             if not current or (not current["content"]["summary"] and job["operation"] != "references"):
                 raise MaterialError("Сохранённый профиль с обзором недоступен.")
-            self.profile = copy.deepcopy(current)
             if job["parent_job_id"]:
                 self.resume_steps = copy.deepcopy(current.get("steps", {}))
-            cached = self.saved(current)
-            self.profile["article"] = cached["article"]
-            self.raw = cached["pdf"]
-            self.document = cached["document"] or extract_pdf(self.raw, self.checkpoint)
-            self.save_material(self.raw, self.profile["article"], self.document)
+            self.restore_profile(current, self.saved(current))
             self.step("core", "completed" if current["content"]["summary"] else "not_applicable")
         else:
             if not cached and job["operation"] == "reanalyze":
@@ -257,12 +262,7 @@ class Pipeline:
                                      lambda: self.store.uploaded_pdf(job["source"]), current, self.usage,
                                      cached=cached, save_material=self.save_material)
             if bundle is None:
-                self.profile = copy.deepcopy(current)
-                cached = self.saved(current)
-                self.profile["article"] = cached["article"]
-                self.raw = cached["pdf"]
-                self.document = cached["document"] or extract_pdf(self.raw, self.checkpoint)
-                self.save_material(self.raw, self.profile["article"], self.document)
+                self.restore_profile(current, self.saved(current))
                 for key in ("core", "references", "analogs"):
                     self.step(key, "completed", "Сохранённая версия актуальна.")
                 if self.profile["article"].get("manuscript"):

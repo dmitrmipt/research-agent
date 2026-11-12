@@ -306,10 +306,21 @@
   font-weight: 400;
 }
 .reference-citations {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 8px;
   margin-top: 3px;
+}
+.reference-citations summary {
+  width: fit-content;
+  font-weight: 600;
+}
+.reference-mention {
+  display: block;
+  padding: 4px 8px;
+  border-left: 2px solid var(--line);
+}
+.reference-mention span {
+  display: block;
+  color: var(--muted);
+  font-weight: 400;
 }
 .profile-items .profile-entry {
   padding: 0;
@@ -376,6 +387,14 @@
 }
 .profile-document pre {
   white-space: pre-wrap;
+}
+.citation-text {
+  font: inherit;
+}
+.citation-text mark {
+  scroll-margin: 25vh 0;
+  color: var(--ink);
+  background: #f8d7a6;
 }
 .profile-document-version {
   margin: 0 0 12px;

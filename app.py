@@ -21,8 +21,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from manuscripts import render_tex_preview
-from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, MaterialError, MaterialLibrary, abstract_from_parts, arxiv_id,
-                       clean_text, extraction_signature, profile_sections, render_markdown_preview, saved_pages, split_sections)
+from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, RMP_REFERENCE_START, MaterialError, MaterialLibrary,
+                       abstract_from_parts, arxiv_id, clean_text, extraction_signature, profile_sections, render_citation_preview,
+                       render_markdown_preview, saved_pages, split_sections)
 from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
                       reference_url)
@@ -156,8 +157,11 @@ class Store:
                 parts = split_sections(saved_pages(text))
                 content = profile["content"]
                 entries = content.get("references") or []
-                if profile["schema_version"] < 7 and parts:
+                if parts and (profile["schema_version"] < 7 or not entries or any(
+                        not entry["number"] and RMP_REFERENCE_START.match(entry["text"]) for entry in entries)):
                     entries = bibliography(parts, entries) or entries
+                if parts:
+                    locate_citations(entries, parts)
                 for entry in entries:
                     entry["url"] = reference_url(entry)
                     if entry.get("title"):
@@ -754,7 +758,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, self.store.jobs())
         if path == "/api/papers":
             return self.respond(200, self.store.papers())
-        match = re.fullmatch(r"/api/papers/([a-f0-9]{32})(?:/(article\.pdf|profile\.md|profile\.html|text\.txt|manuscript\.tex|manuscript\.html))?", path)
+        match = re.fullmatch(r"/api/papers/([a-f0-9]{32})(?:/(article\.pdf|profile\.md|profile\.html|citation\.html|text\.txt|manuscript\.tex|manuscript\.html))?", path)
         if match:
             try:
                 if not match[2]:
@@ -763,12 +767,18 @@ class Handler(BaseHTTPRequestHandler):
                         return self.respond(200, paper)
                 else:
                     filename = match[2]
-                    snapshot = parse_qs(request.query).get("snapshot", [""])[0]
-                    preview = filename == "profile.html"
-                    data = self.store.paper_file(match[1], "profile.md" if preview else filename, snapshot)
+                    query = parse_qs(request.query)
+                    snapshot = query.get("snapshot", [""])[0]
+                    stored = {"profile.html": "profile.md", "citation.html": "text.txt"}.get(filename, filename)
+                    data = self.store.paper_file(match[1], stored, snapshot)
                     if data is not None:
-                        if preview:
+                        if filename == "profile.html":
                             return self.respond(200, render_markdown_preview(data, snapshot), "text/html; charset=utf-8")
+                        if filename == "citation.html":
+                            page = render_citation_preview(data, query.get("at", [""])[0], snapshot)
+                            if page is None:
+                                return self.respond(404, {"error": "Место цитирования не найдено."})
+                            return self.respond(200, page, "text/html; charset=utf-8")
                         mime = {"article.pdf": "application/pdf", "profile.md": "text/markdown; charset=utf-8",
                                 "text.txt": "text/plain; charset=utf-8", "manuscript.html": "text/html; charset=utf-8",
                                 "manuscript.tex": "application/x-tex"}[filename]

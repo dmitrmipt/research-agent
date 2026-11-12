@@ -224,7 +224,7 @@ def crossref_record(record):
         return None
     identifier = doi(record.get("DOI"))
     titles = record.get("title") or []
-    title = metadata_title(titles[0]) if isinstance(titles, list) else ""
+    title = metadata_title(titles[0]) if isinstance(titles, list) and titles else ""
     if not identifier or not title:
         return None
     dates = (record.get("published") or {}).get("date-parts") or []

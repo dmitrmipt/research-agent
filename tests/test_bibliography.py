@@ -3,7 +3,7 @@ from unittest.mock import Mock
 
 from bibliographic import reference_text, vocabulary
 from materials import _reference_item, split_sections
-from publications import _citation_words, _matches_citation, crossref_record, metadata_title
+from publications import Publications, _citation_words, _matches_citation, crossref_record, metadata_title
 from research import apply_reference_hints, bibliography, reference_inputs, resolve_reference_titles
 
 
@@ -46,7 +46,9 @@ class BibliographyTest(unittest.TestCase):
                                 "[1] A. Reader, Superconduc-\ntivity in a topolog-\nical electron-\nphonon system, Journal of Tests, 2020."])
         refs = bibliography(parts)
         self.assertIn("Superconductivity in a topological electron-phonon system", refs[0]["text"])
-        self.assertEqual(refs[0]["citations"], [{"page": 1, "section": "Введение"}])
+        citation, = refs[0]["citations"]
+        self.assertEqual((citation["page"], citation["section"]), (1, "Введение"))
+        self.assertIn("is topological [1]", citation["context"])
 
     def test_model_hints_require_a_verbatim_title_and_do_not_supply_links(self):
         refs = [entry("B. R. Mollow, Physical Review 188, 1969 (1969).")]
@@ -71,6 +73,19 @@ class BibliographyTest(unittest.TestCase):
         for field, value in (("volume", "88"), ("page", "047002"), ("container-title", ["Physical Review B"])):
             wrong = {**data, field: value}
             self.assertFalse(_matches_citation(citation, wrong, crossref_record(wrong)))
+
+    def test_crossref_citation_skips_records_without_titles(self):
+        http = Mock()
+        match = {"DOI": "10.1103/physrev.188.1969", "title": ["Power spectrum of light scattered by two-level systems"],
+                 "author": [{"family": "Mollow"}], "container-title": ["Physical Review"],
+                 "volume": "188", "page": "1969-1975", "published": {"date-parts": [[1969]]}}
+        http.json.return_value = {"message": {"items": [
+            {"DOI": "10.1234/missing-title"}, {"DOI": "10.1234/empty-title", "title": []}, match,
+        ]}}
+        record = Publications().crossref_citation(http, "B. R. Mollow, Physical Review 188, 1969 (1969).")
+        self.assertIsNotNone(record)
+        self.assertEqual(record["doi"], match["DOI"])
+        self.assertEqual(record["title"], match["title"][0])
 
     def test_title_lookup_is_not_limited_to_first_three_references(self):
         refs = [entry(f"A. Reader, Journal of Tests 12, {index} (2020).", str(index)) for index in range(1, 7)]

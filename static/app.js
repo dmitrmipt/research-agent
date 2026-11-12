@@ -294,10 +294,19 @@ function referenceRow(item, pdfUrl) {
   if (item.authors) body.append(el("div", item.authors, "reference-authors"));
   if (item.text) body.append(el("div", item.text, "reference-publication"));
   if (item.citations.length) {
-    const citations = el("div", undefined, "reference-citations");
-    citations.append(el("span", "В тексте"));
+    const citations = el("details", undefined, "reference-citations");
+    citations.append(el("summary", `Места цитирования (${item.citations.length})`));
     for (const place of item.citations) {
-      citations.append(link(place.label, pdfUrl + "#page=" + place.page, undefined, true));
+      const url = new URL(pdfUrl, location.href);
+      url.hash = "page=" + place.page;
+      if (place.anchor) {
+        url.pathname = url.pathname.replace(/article\.pdf$/, "citation.html");
+        url.searchParams.set("at", place.anchor);
+        url.hash = "citation";
+      }
+      const mention = link(place.label, url.href, "reference-mention", true);
+      if (place.context) mention.append(el("span", place.context));
+      citations.append(mention);
     }
     body.append(citations);
   }
