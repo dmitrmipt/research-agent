@@ -343,9 +343,7 @@ function referenceRow(item, pdfUrl) {
       const url = new URL(pdfUrl, location.href);
       url.hash = "page=" + place.page;
       if (place.anchor) {
-        url.pathname = url.pathname.replace(/article\.pdf$/, "citation.html");
-        url.searchParams.set("at", place.anchor);
-        url.hash = "citation";
+        url.searchParams.set("citation", place.anchor);
       }
       const mention = link(place.label, url.href, "reference-mention", true);
       if (place.context) mention.append(el("span", place.context));
@@ -357,13 +355,18 @@ function referenceRow(item, pdfUrl) {
   return row;
 }
 
-function detailRow(item, id, key, pdfUrl) {
+function mathText(node, mode) {
+  if (mode) window.renderProfileMath?.(node, mode);
+  return node;
+}
+
+function detailRow(item, id, key, pdfUrl, math) {
   const row = el("li", undefined, "profile-entry");
   const disclosureKey = key + ":" + (item.href || item.label);
   const details = profileDetails(id, disclosureKey, "profile-entry-details");
   const summary = el("summary", undefined, "profile-entry-summary");
   const caption = el("span", undefined, "profile-entry-caption");
-  caption.append(el("strong", item.label));
+  caption.append(mathText(el("strong", item.label), math && "inline"));
   if (item.byline) caption.append(el("span", item.byline, "subtle"));
   summary.append(caption);
   const facts = el("dl", undefined, "profile-entry-facts");
@@ -375,7 +378,7 @@ function detailRow(item, id, key, pdfUrl) {
       value.append(href ? link(detail.location, href, "profile-entry-location", true)
         : el("div", detail.location, "profile-entry-location"));
     }
-    value.append(el("div", detail.text));
+    value.append(mathText(el("div", detail.text), math && "location" in detail ? "inline" : math));
     fact.append(el("dt", detail.label), value);
     facts.append(fact);
   }
@@ -396,7 +399,7 @@ function profileSection(section, id, pdfUrl, nested = false) {
   }
   summary.append(title);
   const content = el("div", undefined, "profile-section-content");
-  for (const paragraph of section.paragraphs || []) content.append(el("p", paragraph));
+  for (const paragraph of section.paragraphs || []) content.append(mathText(el("p", paragraph), section.math));
   if (section.items.length) {
     const list = el("ul", undefined, "profile-items" + (section.key === "coverage" ? " coverage-facts" : ""));
     for (const item of section.items) {
@@ -405,12 +408,12 @@ function profileSection(section, id, pdfUrl, nested = false) {
         continue;
       }
       if (item.details) {
-        list.append(detailRow(item, id, section.key, pdfUrl));
+        list.append(detailRow(item, id, section.key, pdfUrl, section.math));
         continue;
       }
       const row = el("li");
       const label = /^https?:\/\//i.test(item.href) ? link(item.label, item.href, undefined, true) : el("strong", item.label);
-      row.append(label, el("div", item.text, "profile-item-text"));
+      row.append(mathText(label, section.math && "inline"), mathText(el("div", item.text, "profile-item-text"), section.math));
       list.append(row);
     }
     content.append(list);

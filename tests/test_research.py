@@ -18,12 +18,13 @@ from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 from xml.sax.saxutils import escape
 
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import EMPTY_USAGE, Handler, LocalServer, Store, Worker
 from manuscripts import select_manuscript
-from materials import MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _reference_item, document_text, split_sections
+from materials import MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _pdf_data, _reference_item, citation_location, document_text, split_sections
+from pdf_citations import highlighted_pdf
 from publications import Http, Publications, ServiceError
 from research import BIBLIOGRAPHY_MISSING, _candidate_snippets, bibliography, reference_url
 from pipeline import Pipeline, StepExpired
@@ -229,22 +230,22 @@ class ResearchTest(TempTest):
                 snippet = next(part for part in inputs["snippets"] if QUOTE in part["text"])
                 claim = {"statement": "Измерена разница 4 дБ.", "kind": "measurement", "snippet": snippet["id"],
                          "evidence": QUOTE, "locator": "Несуществующий рисунок 9", "check": "Проверить калибровку.",
-                         "explanation": "Разница относится к измеренным спектрам. Температура образца составила 20 мК."}
+                         "explanation": r"Разница относится к измеренным спектрам. \[\Delta=4\,\mathrm{dB}\]"}
                 answers = [{"question_id": question["question_id"], "answer": reply, "status": status,
                             "sources": [{"snippet": snippet["id"], "evidence": QUOTE}] if status == "answered" else []}
                            for question, (reply, status) in zip(inputs["questions"], (
-                               ("Измерена разница 4 дБ.", "answered"), ("Не указан предел шума.", "insufficient"),
+                               (r"Измерена разница $\Delta=4\,\mathrm{dB}$.", "answered"), ("Не указан предел шума.", "insufficient"),
                            ))]
-                return responses({"summary": ["Изучены микроволновые спектры калиброванным зондом.",
-                                               "Авторы сообщают разницу 4 дБ при 20 мК."],
+                return responses({"summary": [r"Изучены микроволновые спектры при $T=20\,\mathrm{mK}$.",
+                                               r"Авторы сообщают $$\frac{P_1}{P_2}=10^{0.4}$$. Нераспознанная команда $\unknownFixture{x}$."],
                                   "answers": answers[::-1],
-                                  "glossary": [{"term": term, "explanation": "Величина или метод измерения.",
+                                  "glossary": [{"term": term, "explanation": r"Величина или метод измерения. $$\omega_0$$" if term == "Спектр" else "Величина или метод измерения.",
                                                 "role": "Используется при сравнении спектров."}
                                                for term in ("Зонд", "Калибровка", "Спектр", "Децибел",
                                                             "Температура", "Шум", "Микроволновое излучение")],
                                   "keywords": [{"term": term, "importance": weight, "role": "метод"}
                                                for term, weight in [("microwave", 5), ("probe", 4), ("calibration", 3), ("spectra", 2), ("temperature", 1)]],
-                                  "topics": ["Микроволновые измерения"],
+                                  "topics": [r"Микроволновые измерения при $\omega_0$"],
                                   "claims": [claim, {**claim, "statement": "Выдуманное утверждение.", "evidence": "A fabricated sentence."}],
                                   "search_terms": ["microwave probe", "superconducting spectra"], "reference_hints": []})
             if self.empty_analogs:
@@ -298,7 +299,7 @@ class ResearchTest(TempTest):
         self.assertEqual(initial["profile"]["article"]["abstract"], "A study of microwave probe measurements.")
         self.assertEqual(initial["profile"]["article"]["manuscript"], {"name": "nested/main.tex", "file": "manuscript.tex"})
         folder = Path(initial["directory"])
-        self.assertEqual(folder.name, "arxiv-" + FOCAL)
+        self.assertEqual(folder.name, f"A. Physicist — Fixture focal article [arxiv-{FOCAL}]")
         names = set(MANAGED_FILES) - {"manuscript.docx"}
         initial_files = {name: (folder / name).read_bytes() for name in names}
         self.assertEqual(initial_files["manuscript.tex"], TEX + b"v3")
@@ -439,21 +440,32 @@ class ResearchTest(TempTest):
         self.assertIn("\n  B. R. Mollow  \n  Physical Review 188, 1969-1975 (1969)", markdown.decode().replace("\r\n", "\n"))
         self.assertIn("### Ответы на вопросы", markdown.decode())
         self.assertIn("### Словарь терминов", markdown.decode())
+        self.assertIn(r"$$\frac{P_1}{P_2}=10^{0.4}$$", markdown.decode())
+        self.assertNotIn(r"$$\omega_0$$", markdown.decode())
         self.assertIn("(article.pdf#page=1)", markdown.decode())
         revision = profile["revision"]
         preview_path = path + "/profile.html?snapshot=" + revision
         preview = self.call(preview_path, raw=True).decode()
         self.assertIn("<h1>Uploaded paper</h1>", preview)
+        self.assertIn(r'<span class="profile-math-source">$$\frac{P_1}{P_2}=10^{0.4}$$</span>', preview)
         self.assertIn("B. R. Mollow<br>", preview)
         self.assertNotIn("<strong>B. R. Mollow</strong>", preview)
         self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', preview)
         at = citation["anchor"]
-        self.assertIn(f'href="citation.html?at={at}&amp;snapshot={revision}#citation"', preview)
-        source = self.call(f"{path}/citation.html?at={at}&snapshot={revision}", raw=True).decode()
-        self.assertIn('Prior experiments are described in <mark id="citation">[1-3]</mark>', source)
-        self.assertIn(f'href="article.pdf?snapshot={revision}#page=1"', source)
+        self.assertIn(f'href="article.pdf?snapshot={revision}&amp;citation={at}#page=1"', preview)
+        marked_path = f"{path}/article.pdf?snapshot={revision}&citation={at}"
+        with urlopen(self.url + marked_path, timeout=6) as response:
+            self.assertEqual(response.headers.get_content_type(), "application/pdf")
+            self.assertIsNone(response.headers.get("Content-Disposition"))
+            marked = response.read()
+        annotation = PdfReader(io.BytesIO(marked)).pages[0]["/Annots"][-1].get_object()
+        self.assertEqual(annotation["/Subtype"], "/Highlight")
+        self.assertGreater(len(annotation["/QuadPoints"]), 0)
+        redirected = self.call(f"{path}/citation.html?at={at}&snapshot={revision}", raw=True)
+        legacy_annotation = PdfReader(io.BytesIO(redirected)).pages[0]["/Annots"][-1].get_object()
+        self.assertEqual(legacy_annotation["/QuadPoints"], annotation["/QuadPoints"])
         with self.assertRaises(HTTPError) as missing_citation:
-            self.call(f"{path}/citation.html?at=999-1-9&snapshot={revision}", raw=True)
+            self.call(f"{path}/article.pdf?citation=999-1-9&snapshot={revision}", raw=True)
         self.assertEqual(missing_citation.exception.code, 404)
         with self.assertRaises(HTTPError) as stale_citation:
             self.call(f"{path}/citation.html?at={at}&snapshot=obsolete", raw=True)
@@ -799,6 +811,27 @@ class ResearchTest(TempTest):
 
 
 class StorageTest(TempTest):
+    def test_legacy_folder_is_renamed_with_author_and_title_and_keeps_files(self):
+        library, source, _, pdf = self._save_old_profile(["Article text"], schema_version=PROFILE_VERSION)
+        profile = library.profile(source)
+        profile["article"].update(authors=["A. Reader", "B. Author"], title='Paper: angle / slash?')
+        library.publish(source, pdf, library.read_text(source), profile)
+        folder = library.folder(source)
+        notes = folder / "notes.md"
+        notes.write_text("Reader notes", encoding="utf-8")
+        before = {file.name: file.read_bytes() for file in folder.iterdir() if file.is_file()}
+        legacy = library.root / f"arxiv-{FOCAL}"
+        self.assertEqual(folder.resolve().parent, library.root)
+        self.assertEqual(legacy.resolve().parent, library.root)
+        folder.rename(legacy)
+
+        reopened = MaterialLibrary(library.root)
+        renamed = reopened.folder(source)
+        self.assertEqual(renamed.name, f"A. Reader — Paper angle slash [arxiv-{FOCAL}]")
+        self.assertFalse(legacy.exists())
+        self.assertEqual({file.name: file.read_bytes() for file in renamed.iterdir() if file.is_file()}, before)
+        self.assertEqual(library.folder(source), renamed)
+
     def test_legacy_numbered_references_repair_wraps_without_losing_metadata(self):
         old = {"number": "1", "page": 1, "text": "A. Reader, Superconduc- tivity, Journal of Tests, 2020.",
                "title": "Superconductivity", "arxiv_ids": [], "dois": ["10.1234/saved"],
@@ -941,8 +974,9 @@ class StorageTest(TempTest):
         self.assertEqual((folder / "user-notes.txt").read_bytes(), b"Reader notes")
         self.assertFalse((folder / ".rollback").exists())
 
-    def test_publication_retries_transient_windows_directory_errors(self):
+    def test_publication_retries_transient_windows_move_errors(self):
         rename = Path.rename
+        replace = Path.replace
         interrupted = set()
 
         def rename_with_temporary_lock(path, destination):
@@ -953,9 +987,18 @@ class StorageTest(TempTest):
                 raise error
             return rename(path, destination)
 
-        with patch.object(Path, "rename", rename_with_temporary_lock), patch("materials.time.sleep"):
+        def replace_with_temporary_lock(path, destination):
+            if path.name == "profile.json" and path.name not in interrupted:
+                interrupted.add(path.name)
+                error = PermissionError("Temporary file lock")
+                error.winerror = 32
+                raise error
+            return replace(path, destination)
+
+        with patch.object(Path, "rename", rename_with_temporary_lock), \
+                patch.object(Path, "replace", replace_with_temporary_lock), patch("materials.time.sleep"):
             library, source, _, pdf = self._save_old_profile(["Article text"], schema_version=PROFILE_VERSION)
-        self.assertEqual(interrupted, {".prepare", ".rollback"})
+        self.assertEqual(interrupted, {".prepare", ".rollback", "profile.json"})
         self.assertEqual(library.read(source, "article.pdf"), pdf)
         self.assertEqual(library.profile(source)["job_id"], "original")
         self.assertFalse((library.folder(source) / ".rollback").exists())
@@ -984,6 +1027,25 @@ class StorageTest(TempTest):
 
 
 class ParsingTest(unittest.TestCase):
+    def test_pdf_highlight_distinguishes_two_mentions_on_the_same_page(self):
+        raw = pdf_bytes("Repeated citations", QUOTE + " The result also cites [1-3].")
+        document = _pdf_data(raw)
+        parts = split_sections(document["pages"])
+        text = document_text(document).encode()
+        mentions = bibliography(parts)[0]["citations"]
+        self.assertEqual(len(mentions), 2)
+        bottoms = []
+        for mention in mentions:
+            marked = highlighted_pdf(raw, *citation_location(text, mention["anchor"]))
+            page = PdfReader(io.BytesIO(marked)).pages[0]
+            annotation = page["/Annots"][-1].get_object()
+            self.assertEqual(annotation["/Subtype"], "/Highlight")
+            self.assertEqual(page.extract_text(), document["pages"][0])
+            bottoms.append(float(annotation["/Rect"][1]))
+        self.assertGreater(bottoms[0], bottoms[1] + 50)
+        self.assertNotIn("/Annots", PdfReader(io.BytesIO(raw)).pages[0])
+        self.assertEqual(highlighted_pdf(raw, 1, "[1-3]", 0, 5), raw)
+
     def test_reference_link_priority_and_year_without_metadata(self):
         entry = {"number": "1", "text": "A. Reader, Sample article, Journal of Tests, 2022.",
                  "arxiv_ids": [], "dois": ["10.1234/example"], "url": ""}

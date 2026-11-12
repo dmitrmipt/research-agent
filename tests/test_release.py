@@ -11,7 +11,7 @@ from urllib.error import HTTPError
 from app import EMPTY_USAGE, Store
 from materials import EXTRACTION_VERSION, MaterialLibrary, profile_sections
 from model_catalog import Catalog, cost, model_info, validate_effort
-from publications import Http, Model, PROFILE_SCHEMA, ServiceError
+from publications import Http, Model, PROFILE_SCHEMA, REFERENCE_SCHEMA, ServiceError
 from research import _question_answers, prepare_profile
 from retrieval import BUDGETS, chunks, select
 
@@ -67,6 +67,30 @@ class SelectionTest(unittest.TestCase):
 
 
 class ModelTest(unittest.TestCase):
+    def test_larger_model_request_respects_response_timeout_and_job_deadline(self):
+        payload = json.dumps({"status": "completed", "output": [{"type": "message", "content": [
+            {"type": "output_text", "text": '{"reference_hints": []}'}]}]}).encode()
+        for remaining, expected_timeout in ((240, 200), (120, 120)):
+            with self.subTest(remaining=remaining):
+                http = Http(lambda: remaining)
+                model = Model(http, "fixture", {"model": "gpt-6-luna", "max_output_tokens": 1000},
+                              lambda: None, lambda usage: None)
+                with patch.object(http.opener, "open", return_value=io.BytesIO(payload)) as send:
+                    model.ask("reference_titles", REFERENCE_SCHEMA, "instructions", {"text": "я" * 240_000})
+                    self.assertEqual(send.call_args.kwargs["timeout"], expected_timeout)
+                    self.assertGreater(len(send.call_args.args[0].data), 480_000)
+
+    def test_oversized_utf8_request_is_rejected_before_api_call(self):
+        http = Http(lambda: 240)
+        def unexpected_call():
+            self.fail("Oversized request must not count as an API call")
+        model = Model(http, "fixture", {"model": "gpt-6-luna", "max_output_tokens": 1000},
+                      unexpected_call, lambda usage: None)
+        with patch.object(http.opener, "open") as send:
+            with self.assertRaisesRegex(ServiceError, "Запрос к модели слишком велик"):
+                model.ask("reference_titles", REFERENCE_SCHEMA, "instructions", {"text": "я" * 250_000})
+            send.assert_not_called()
+
     def test_quota_error_is_distinguished_without_exposing_server_message(self):
         http = Http(lambda: 100)
         body = io.BytesIO(json.dumps({"error": {"code": "insufficient_quota", "message": "private account details"}}).encode())

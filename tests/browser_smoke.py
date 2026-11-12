@@ -108,13 +108,25 @@ def check_design(page, fixture, paper_id, screenshots):
             citations = page.locator(".reference-citations").first
             if not citations.evaluate("node => node.open"):
                 citations.locator("summary").click()
+            citation_link = page.locator(selector).first
+            href = citation_link.get_attribute("href")
+            assert "/article.pdf?" in href and "citation=" in href and "#page=1" in href
+            response = page.request.get(href.split("#", 1)[0])
+            assert response.ok and response.headers["content-type"] == "application/pdf"
+            assert b"/Highlight" in response.body()
         with page.expect_popup() as opened:
             page.locator(selector).first.click()
         document = opened.value
         document.wait_for_load_state()
-        expect(document.locator(".profile-document")).to_be_visible()
         if name == "citation":
-            expect(document.locator("mark#citation")).to_be_visible()
+            expect(document).to_have_url(href)
+            assert document.evaluate("document.contentType") == "application/pdf"
+            document.close()
+            continue
+        expect(document.locator(".profile-document")).to_be_visible()
+        if name == "document":
+            expect(document.locator(".formula-display mfrac")).to_be_visible()
+            expect(document.locator(".formula-inline msub").first).to_be_visible()
         for width in (1440, 390):
             document.set_viewport_size({"width": width, "height": 1000 if width == 1440 else 844})
             document.evaluate("document.fonts.ready")
@@ -177,6 +189,25 @@ def run(channel=None, screenshots=None):
             expect(page.locator("#job-detail")).to_contain_text("Расчётная стоимость")
             page.locator('#job-detail a[href^="#paper/"]').click()
             expect(page.locator("#paper-profile h1")).to_contain_text("Fixture focal article")
+            overview = page.locator('[data-section="overview"]')
+            expect(overview.locator(".formula-inline math").first).to_be_visible()
+            expect(overview.locator(".formula-display mfrac")).to_be_visible()
+            expect(overview).to_contain_text(r"$\unknownFixture{x}$")
+            glossary = page.locator('[data-section="glossary"]')
+            glossary.locator(":scope > summary").click()
+            expect(glossary.locator(".formula-inline msub")).to_be_visible()
+            expect(glossary.locator(".formula-display")).to_have_count(0)
+            glossary.locator(":scope > summary").click()
+            keywords = page.locator('[data-section="keywords"]')
+            keywords.locator(":scope > summary").click()
+            expect(keywords.locator(".formula-inline msub")).to_be_visible()
+            keywords.locator(":scope > summary").click()
+            assert page.evaluate(r"""() => {
+                const node = document.createElement('div');
+                node.textContent = String.raw`$\href{javascript:alert(1)}{x}\includegraphics{https://example.org/x.png}$`;
+                window.renderProfileMath(node);
+                return !node.querySelector('a, img, [href], [src]');
+            }""")
             coverage = page.locator('[data-section="coverage"]')
             coverage.locator(":scope > summary").click()
             expect(coverage.locator(".step-list li")).to_have_count(5)
@@ -187,6 +218,7 @@ def run(channel=None, screenshots=None):
             page.locator('[data-section="answers"] > summary').click()
             page.locator('[data-section="answers"] .profile-entry-summary').first.click()
             expect(page.locator('[data-section="answers"]')).to_contain_text(QUOTE)
+            expect(page.locator('[data-section="answers"] .formula-inline math')).to_be_visible()
             page.get_by_role("button", name="Разобрать заново", exact=True).click()
             expect(page.locator("#analysis-dialog")).to_be_visible()
             expect(page.locator("#analysis-depth")).to_have_value("full")

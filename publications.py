@@ -27,7 +27,8 @@ RESPONSES = "https://api.openai.com/v1/responses"
 ATOM = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 DOI = re.compile(r"10\.\d{4,9}/[a-z0-9._;()/:+%\-]+", re.I | re.ASCII)
 READ_LIMIT = 2 * 1024 * 1024
-MAX_PROMPT_BYTES = 220_000
+MAX_PROMPT_BYTES = 500_000
+MODEL_RESPONSE_TIMEOUT = 200
 ARXIV_QUERY_INTERVAL = 3.05
 
 
@@ -425,7 +426,7 @@ class Model:
             raise ServiceError("Запрос к модели слишком велик. Выберите меньший охват текста и запустите разбор заново.")
         self.http.checkpoint()
         self.start_call()
-        response = self.http.json(RESPONSES, "OpenAI", data=raw, timeout=75,
+        response = self.http.json(RESPONSES, "OpenAI", data=raw, timeout=MODEL_RESPONSE_TIMEOUT,
                                   headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
         self.record_usage(response.get("usage"))
         if response.get("status") != "completed":

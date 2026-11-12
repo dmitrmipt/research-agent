@@ -18,11 +18,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.util import find_spec
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from manuscripts import render_tex_preview
 from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, RMP_REFERENCE_START, MaterialError, MaterialLibrary,
-                       abstract_from_parts, arxiv_id, clean_text, extraction_signature, profile_sections, render_citation_preview,
+                       abstract_from_parts, arxiv_id, citation_location, clean_text, extraction_signature, profile_sections,
                        render_markdown_preview, saved_pages, split_sections)
 from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
@@ -31,6 +31,7 @@ from retrieval import BUDGETS
 from version import VERSION
 from model_catalog import Catalog, cost, model_info, validate_effort
 from pipeline import JobExpired, JobStopped, Pipeline, STEP_NAMES
+from pdf_citations import highlighted_pdf
 
 ROOT = Path(__file__).resolve().parent
 ACTIVE = ("queued", "running")
@@ -40,7 +41,7 @@ STAGES = ["Получение материалов", "Выделение утв�
 DEFAULTS = {
     "interests": "", "exclusions": "",
     "rules": "Различать утверждения авторов и независимые проверки. Для замечаний указывать место в статье, обоснование и статус проверки. Новизну, надёжность и значимость оценивать отдельно. Явно описывать границы анализа.",
-    "language": "Русский", "stage_seconds": 3, "time_limit_seconds": 120,
+    "language": "Русский", "stage_seconds": 3, "time_limit_seconds": 240,
     "model": "gpt-6-luna", "reasoning_effort": "low", "max_api_calls": 2, "max_output_tokens": 5000,
 }
 EMPTY_USAGE = {"model": "", "calls": 0, "reported_calls": 0, "input_tokens": 0, "output_tokens": 0,
@@ -738,12 +739,31 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
+    def citation_pdf(self, paper_id, snapshot, anchor, redirect=False):
+        with self.store.lock:
+            text = self.store.paper_file(paper_id, "text.txt", snapshot)
+            raw = None if redirect else self.store.paper_file(paper_id, "article.pdf", snapshot)
+        location = citation_location(text, anchor) if text is not None else None
+        if location is None or (not redirect and raw is None):
+            return self.respond(404, {"error": "Место цитирования не найдено."})
+        if redirect:
+            query = urlencode({"snapshot": snapshot, "citation": anchor})
+            self.send_response(302)
+            self.send_header("Location", f"article.pdf?{query}#page={location[0]}")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        return self.respond(200, highlighted_pdf(raw, *location), "application/pdf")
+
     def do_GET(self):
         if not self.allowed():
             return
         request = urlparse(self.path)
         path = request.path
         static = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
+        static.update({"/" + name: (name, "text/javascript; charset=utf-8")
+                       for name in ("math.js", "vendor/katex/katex.min.js")})
         static.update({"/fonts/" + name: ("fonts/" + name, mime) for name, mime in (
             ("InterVariable.woff2", "font/woff2"), ("PTSerif-Regular.ttf", "font/ttf"), ("PTSerif-Bold.ttf", "font/ttf"))})
         if path in static:
@@ -773,16 +793,15 @@ class Handler(BaseHTTPRequestHandler):
                     filename = match[2]
                     query = parse_qs(request.query)
                     snapshot = query.get("snapshot", [""])[0]
-                    stored = {"profile.html": "profile.md", "citation.html": "text.txt"}.get(filename, filename)
+                    if filename == "citation.html":
+                        return self.citation_pdf(match[1], snapshot, query.get("at", [""])[0], redirect=True)
+                    if filename == "article.pdf" and "citation" in query:
+                        return self.citation_pdf(match[1], snapshot, query["citation"][0])
+                    stored = "profile.md" if filename == "profile.html" else filename
                     data = self.store.paper_file(match[1], stored, snapshot)
                     if data is not None:
                         if filename == "profile.html":
                             return self.respond(200, render_markdown_preview(data, snapshot), "text/html; charset=utf-8")
-                        if filename == "citation.html":
-                            page = render_citation_preview(data, query.get("at", [""])[0], snapshot)
-                            if page is None:
-                                return self.respond(404, {"error": "Место цитирования не найдено."})
-                            return self.respond(200, page, "text/html; charset=utf-8")
                         mime = {"article.pdf": "application/pdf", "profile.md": "text/markdown; charset=utf-8",
                                 "text.txt": "text/plain; charset=utf-8", "manuscript.html": "text/html; charset=utf-8",
                                 "manuscript.tex": "application/x-tex"}[filename]
