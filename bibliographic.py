@@ -13,6 +13,14 @@ def vocabulary(text):
 def reference_text(text, words=()):
     words = set(words)
     text = text.replace("\u00ad", "")
+    text = re.sub(r"(https?):\s+(?=//)", r"\1:", text)
+    identifier = r"(?:https?://|10\.\d{4,9}/)\S*"
+    wrap = re.compile(rf"({identifier}(?<=[/:]))[ \t]*\r?\n[ \t]*(?=[A-Za-z0-9~])"
+                      rf"|({identifier}(?<=\.))[ \t]*\r?\n[ \t]*(?=[a-z0-9])")
+    while True:
+        text, joined = wrap.subn(r"\1\2", text)
+        if not joined:
+            break
 
     def repair(match):
         left, gap, right = match.group(1, 2, 3)

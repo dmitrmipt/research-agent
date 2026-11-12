@@ -905,6 +905,26 @@ class StorageTest(TempTest):
             self.assertEqual(library.read(source, "article.pdf"), pdf)
             self.assertEqual(store.jobs(), [])
 
+    def test_upgrade_recovers_alpha_bibliography_without_new_job(self):
+        pages = ["Introduction\nFirst [AA20; Ber26a]. Again [AA20].\n"
+                 "References\n[AA20] Alice Reader. First paper, 2020.\n[Ber26a] Bob Writer. Second paper,\n2026."]
+        merged = {"number": "", "page": 1, "text": "[AA20] Alice Reader. First paper, 2020. [Ber26a] Bob Writer. Second paper, 2026.",
+                  "arxiv_ids": [], "dois": [], "url": "", "citations": []}
+        library, source, paper_id, pdf = self._save_old_profile(pages, schema_version=8, references=[merged])
+        original = library.profile(source)
+        original["content"]["summary"] = ["Previously saved overview."]
+        library.publish(source, pdf, library.read_text(source), original)
+        with patch("publications.Http.read", side_effect=AssertionError("Migration must be local")), closing(Store(self.temp).db) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+        recovered = library.profile(source)
+        refs = recovered["content"]["references"]
+        self.assertEqual([ref["number"] for ref in refs], ["AA20", "Ber26a"])
+        self.assertEqual([len(ref["citations"]) for ref in refs], [2, 1])
+        self.assertEqual(recovered["content"]["summary"], original["content"]["summary"])
+        self.assertEqual(recovered["usage"], original["usage"])
+        self.assertEqual(library.read(source, "article.pdf"), pdf)
+        self.assertIn(r"\[Ber26a\]", library.read(source, "profile.md").decode())
+
     def test_recover_interrupted_file_replacement(self):
         library = MaterialLibrary(self.temp / "Materials")
         source = "arxiv:" + FOCAL

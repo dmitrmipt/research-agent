@@ -251,6 +251,8 @@ input[type="file"] { padding: 26px 16px; border-style: dashed; background: var(-
 input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px; border: 1px solid var(--line); border-radius: 4px; background: var(--card); color: var(--accent); cursor: pointer; }
 .hint { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.65; overflow-wrap: anywhere; }
 .hint:empty { display: none; }
+.question-presets { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0 4px; }
+.question-presets .secondary { min-height: 36px; padding: 7px 10px; color: var(--accent); font-size: 12px; text-align: left; }
 .form-divider { height: 1px; margin: 30px 0; background: var(--line); }
 .field-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 20px; }
 .form-footer {
@@ -418,6 +420,11 @@ summary { padding: 6px 0; cursor: pointer; color: var(--accent); }
 .profile-items { list-style: none; padding: 0; margin: 0; }
 .profile-items li { border-top: 1px solid var(--line); padding: 14px 0; overflow-wrap: anywhere; }
 .profile-items li:last-child { padding-bottom: 0; }
+.coverage-facts li { display: grid; grid-template-columns: minmax(120px, 1fr) minmax(0, 3fr); gap: 8px 16px; padding: 8px 0; font-size: 13px; }
+.coverage-facts .profile-item-text { margin: 0; }
+.coverage-stages { margin: 20px 0 0; }
+.coverage-stages .step-list li:not(.step-state-completed) { --step-color: var(--muted); }
+.coverage-step-notes { margin: 0; }
 .profile-items a { font-weight: 600; }
 .profile-item-text { margin-top: 4px; font-size: 13px; line-height: 1.75; white-space: pre-line; color: var(--muted); }
 [data-section="keywords"] .profile-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
@@ -575,6 +582,7 @@ footer { display: flex; align-items: center; justify-content: space-between; gap
   .profile-section > summary { padding: 16px; gap: 12px; }
   .profile-section h2 { font-size: 21px; }
   .profile-section-content { padding: 0 16px 18px; font-size: 14px; }
+  .coverage-facts li { grid-template-columns: minmax(0, 1fr); gap: 3px; }
   .profile-subsection > summary { padding: 12px; }
   .profile-subsection > .profile-section-content { padding: 0 12px 12px; }
   .profile-entry-facts { margin-inline: 0; }

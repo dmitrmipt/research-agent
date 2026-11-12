@@ -27,12 +27,14 @@ from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, RMP_REFER
 from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
                       reference_url)
+from retrieval import BUDGETS
 from version import VERSION
 from model_catalog import Catalog, cost, model_info, validate_effort
 from pipeline import JobExpired, JobStopped, Pipeline, STEP_NAMES
 
 ROOT = Path(__file__).resolve().parent
 ACTIVE = ("queued", "running")
+ANALYSIS_DEPTHS = tuple(BUDGETS)
 STAGES = ["Получение материалов", "Выделение утверждений", "Поиск предшественников",
           "Проверки", "Подготовка отчёта"]
 DEFAULTS = {
@@ -157,7 +159,7 @@ class Store:
                 parts = split_sections(saved_pages(text))
                 content = profile["content"]
                 entries = content.get("references") or []
-                if parts and (profile["schema_version"] < 7 or not entries or any(
+                if parts and (profile["schema_version"] < 9 or not entries or any(
                         not entry["number"] and RMP_REFERENCE_START.match(entry["text"]) for entry in entries)):
                     entries = bibliography(parts, entries) or entries
                 if parts:
@@ -235,7 +237,7 @@ class Store:
         scenario = data.get("scenario", "success")
         questions = data.get("questions", "")
         job_settings = self.validate_settings(data.get("settings", {}))
-        if mode not in ("demo", "research") or depth not in ("brief", "standard", "deep") or scenario not in ("success", "error"):
+        if mode not in ("demo", "research") or depth not in ANALYSIS_DEPTHS or scenario not in ("success", "error"):
             raise ValueError("Неизвестная глубина или сценарий.")
         if not isinstance(questions, str) or len(questions) > 12000:
             raise ValueError("Вопросы должны быть текстом длиной не более 12000 символов.")
@@ -333,7 +335,7 @@ class Store:
 
     @staticmethod
     def validate_analysis(depth, questions):
-        if depth not in ("brief", "standard", "deep") or not isinstance(questions, str) or len(questions) > 12000:
+        if depth not in ANALYSIS_DEPTHS or not isinstance(questions, str) or len(questions) > 12000:
             raise ValueError("Проверьте охват текста и вопросы (не более 12000 символов).")
 
     def retry(self, job_id, data):

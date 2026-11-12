@@ -45,11 +45,17 @@
         <div class="form-divider"></div><h2>Фокус внимания</h2>
         <label for="questions">Что особенно важно проверить? <span class="optional">необязательно</span></label><textarea id="questions" rows="3" maxlength="12000" aria-describedby="questions-hint" placeholder="При каких условиях справедливы выводы?"></textarea>
         <p id="questions-hint" class="hint">Для отдельных ответов пишите по одному вопросу со знаком «?» на строку или пронумеруйте вопросы. Остальной текст задаёт акценты обзора.</p>
+        <div class="question-presets" role="group" aria-label="Готовые вопросы">
+          <button type="button" class="secondary" data-question>Что измерили экспериментально?</button>
+          <button type="button" class="secondary" data-question>Что получили расчётом или моделированием?</button>
+          <button type="button" class="secondary" data-question>Какие допущения ограничивают выводы?</button>
+          <button type="button" class="secondary" data-question>Что нужно для воспроизведения результата?</button>
+        </div>
         <div class="field-row">
-          <div><label for="depth">Охват текста статьи</label><select id="depth"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option></select></div>
+          <div><label for="depth">Охват текста статьи</label><select id="depth"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option><option value="full">Передавать полный текст</option></select></div>
           <div><label for="mode">Режим</label><select id="mode"><option value="research">Подготовить профиль</option><option value="demo">Демонстрация</option></select></div>
         </div>
-        <p class="hint">Короткая статья передаётся целиком. Для длинной выбираются фрагменты до 2000 символов с перекрытием до 200: общий охват и материал по вашим вопросам. Усилие модели выбирается отдельно ниже.</p>
+        <p class="hint">С лимитом для длинной статьи отбираются фрагменты по разделам и вашим вопросам. Полный режим отправляет весь извлечённый текст одним запросом. Для слишком большого запроса понадобится выбрать лимит. Библиография обрабатывается отдельно.</p>
         <div class="field-row new-model-fields">
           <div><label for="new-model">Модель для этой статьи</label><select id="new-model"><option value="gpt-6-luna">GPT-6 Luna</option></select></div>
           <div><label for="new-effort">Усилие анализа</label><select id="new-effort"><option value="low">Низкое · low</option></select></div>
@@ -147,7 +153,7 @@
         <p id="analysis-description" class="hint"></p>
         <label for="analysis-preset">Начальные настройки</label><select id="analysis-preset"><option value="previous">Из предыдущего разбора</option><option value="current">Текущие общие настройки</option></select>
         <div id="analysis-questions-wrap"><label for="analysis-questions">Вопросы и фокус</label><textarea id="analysis-questions" rows="4" maxlength="12000"></textarea>
-          <label for="analysis-depth">Охват текста</label><select id="analysis-depth"><option value="brief">16 000 символов</option><option value="standard">30 000 символов</option><option value="deep">48 000 символов</option></select></div>
+          <label for="analysis-depth">Охват текста</label><select id="analysis-depth"><option value="brief">16 000 символов</option><option value="standard">30 000 символов</option><option value="deep">48 000 символов</option><option value="full">Передавать полный текст</option></select></div>
         <label for="analysis-model">Модель</label><input id="analysis-model" list="analysis-models" maxlength="120" required><datalist id="analysis-models"></datalist>
         <label for="analysis-effort">Усилие анализа</label><select id="analysis-effort"></select>
         <div class="field-row"><div><label for="analysis-calls">Максимум вызовов</label><input id="analysis-calls" type="number" min="1" max="2" required></div><div><label for="analysis-time">Лимит времени, с</label><input id="analysis-time" type="number" min="5" max="600" required></div></div>

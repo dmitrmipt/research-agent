@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const statusNames = {queued:"В очереди",running:"Выполняется",completed:"Завершено",cancelled:"Остановлено",failed:"Ошибка",interrupted:"Прервано"};
-const depthNames = {brief:"16 000 символов",standard:"30 000 символов",deep:"48 000 символов"};
+const depthNames = {brief:"16 000 символов",standard:"30 000 символов",deep:"48 000 символов",full:"Полный текст"};
 const stepNames = {material:"Материал",core:"Обзор",references:"Библиография",analogs:"Аналоги",manuscript:"Исходник"};
 const stepStates = {pending:"Ожидает",running:"Выполняется",completed:"Готово",failed:"Ошибка",skipped:"Пропущено",blocked:"Требуется действие",not_applicable:"Не требуется"};
 const effortNames = {auto:"По умолчанию модели",none:"Без дополнительного рассуждения",low:"Низкое · low",medium:"Среднее · medium",high:"Высокое · high",xhigh:"Очень высокое · xhigh",max:"Максимальное · max"};
@@ -62,6 +62,21 @@ function renderMode() {
   $("setup-state").textContent = demo ? "" : messages.join(" ");
 }
 $("mode").addEventListener("change", renderMode);
+document.querySelectorAll("[data-question]").forEach(button => button.addEventListener("click", () => {
+  const field = $("questions");
+  const question = button.textContent.trim();
+  const current = field.value.trimEnd();
+  if (!current.split("\n").some(line => line.trim() === question)) {
+    const combined = [current, question].filter(Boolean).join("\n");
+    if (combined.length > field.maxLength) {
+      notify("Не хватает места для ещё одного вопроса.", true);
+      return;
+    }
+    field.value = combined;
+  }
+  field.focus();
+  field.setSelectionRange(field.value.length, field.value.length);
+}));
 function showJob(job) {
   selectedJob = job.id;
   paperFilter = null;
@@ -121,8 +136,8 @@ function apiUsage(usage) {
   return `${usage.model} · вызовов: ${usage.calls} · вход: ${usage.input_tokens} · выход: ${usage.output_tokens} токенов`
     + (unknown ? ` · нет данных о токенах по ${unknown} вызовам` : "");
 }
-function stepsView(steps) {
-  const section = el("section", undefined, "processing-stages");
+function stepsView(steps, compact = false) {
+  const section = el("section", undefined, "processing-stages" + (compact ? " coverage-stages" : ""));
   section.setAttribute("aria-label", "Этапы обработки");
   const list = el("ol", undefined, "step-list");
   const notes = el("dl", undefined, "step-notes");
@@ -135,7 +150,11 @@ function stepsView(steps) {
     list.append(row);
   }
   section.append(list);
-  if (notes.childElementCount) section.append(notes);
+  if (notes.childElementCount && compact) {
+    const details = el("details", undefined, "coverage-step-notes");
+    details.append(el("summary", "Сообщения этапов"), notes);
+    section.append(details);
+  } else if (notes.childElementCount) section.append(notes);
   return section;
 }
 function retryButton(job) {
@@ -379,7 +398,7 @@ function profileSection(section, id, pdfUrl, nested = false) {
   const content = el("div", undefined, "profile-section-content");
   for (const paragraph of section.paragraphs || []) content.append(el("p", paragraph));
   if (section.items.length) {
-    const list = el("ul", undefined, "profile-items");
+    const list = el("ul", undefined, "profile-items" + (section.key === "coverage" ? " coverage-facts" : ""));
     for (const item of section.items) {
       if (section.key === "references") {
         list.append(referenceRow(item, pdfUrl));
@@ -396,6 +415,7 @@ function profileSection(section, id, pdfUrl, nested = false) {
     }
     content.append(list);
   }
+  if (section.steps && Object.keys(section.steps).length) content.append(stepsView(section.steps, true));
   for (const subsection of section.subsections || []) {
     content.append(profileSection(subsection, id, pdfUrl, true));
   }

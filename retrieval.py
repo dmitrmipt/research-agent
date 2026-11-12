@@ -8,7 +8,7 @@ from collections import Counter
 VERSION = 1
 CHUNK_SIZE = 2000
 OVERLAP = 200
-BUDGETS = {"brief": 16_000, "standard": 30_000, "deep": 48_000}
+BUDGETS = {"brief": 16_000, "standard": 30_000, "deep": 48_000, "full": None}
 EXCLUDED = {"Библиография", "Благодарности"}
 # Small, explicit cross-language aliases; no remote translation or inference.
 ALIASES = {
@@ -126,11 +126,12 @@ def overview_order(snippets):
 
 def select(parts, abstract, budget, focus="", questions=()):
     available = chunks(parts)
-    abstract_text = compact(abstract)[:min(4000, budget)]
+    abstract_text = compact(abstract)[:4000 if budget is None else min(4000, budget)]
     intro = ([{"id": "abstract", "page": None, "section": "Аннотация arXiv", "text": abstract_text}]
              if abstract_text else [])
-    remaining = budget - len(abstract_text)
     total = sum(len(item["text"]) for item in available) + len(abstract_text)
+    limit = total if budget is None else budget
+    remaining = limit - len(abstract_text)
     selected, used = [], set()
 
     def take(order, allowance):
@@ -144,7 +145,7 @@ def select(parts, abstract, budget, focus="", questions=()):
         return spent
 
     queries = [item["text"] for item in questions] + ([focus] if focus.strip() else [])
-    if total <= budget:
+    if total <= limit:
         take(range(len(available)), remaining)
     else:
         general = overview_order(available)
@@ -155,7 +156,7 @@ def select(parts, abstract, budget, focus="", questions=()):
             for order in query_orders:
                 remaining -= take(order, each)
             # Select general context after reserving material for each question.
-            remaining -= take(general, (budget - len(abstract_text)) // 2)
+            remaining -= take(general, (limit - len(abstract_text)) // 2)
             merged = [index for offset in range(max(map(len, query_orders), default=0))
                       for order in query_orders if offset < len(order) for index in [order[offset]]]
             remaining -= take(merged, remaining)

@@ -13,7 +13,7 @@ from materials import EXTRACTION_VERSION, MaterialLibrary, profile_sections
 from model_catalog import Catalog, cost, model_info, validate_effort
 from publications import Http, Model, PROFILE_SCHEMA, ServiceError
 from research import _question_answers, prepare_profile
-from retrieval import chunks, select
+from retrieval import BUDGETS, chunks, select
 
 
 class SelectionTest(unittest.TestCase):
@@ -53,6 +53,17 @@ class SelectionTest(unittest.TestCase):
         self.assertIn(38, report["pages"])
         self.assertIn(54, report["pages"])
         self.assertEqual(len({item["id"] for item in snippets}), len(snippets))
+
+    def test_full_text_includes_late_pages_beyond_largest_character_budget(self):
+        parts = [{"page": page, "section": "Результаты", "text": "Calibrated measurement. " * 180}
+                 for page in range(1, 21)]
+        parts.append({"page": 21, "section": "Библиография", "text": "Reference list."})
+        snippets, report = select(parts, "Abstract.", BUDGETS["full"], questions=[{"text": "What was measured?"}])
+        self.assertFalse(report["sampled"])
+        self.assertIsNone(report["budget_chars"])
+        self.assertGreater(report["selected_chars"], BUDGETS["deep"])
+        self.assertEqual(report["pages"], list(range(1, 21)))
+        self.assertEqual(report["selected_chars"], sum(len(item["text"]) for item in snippets))
 
 
 class ModelTest(unittest.TestCase):

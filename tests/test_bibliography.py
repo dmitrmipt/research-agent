@@ -61,8 +61,77 @@ class BibliographyTest(unittest.TestCase):
         contextual = [{"reference_id": "r1", "text": refs[0]["text"], "context": "The cited work Power spectrum of light [1]."}]
         apply_reference_hints(refs, contextual, [{"reference_id": "r1", "title": "Power spectrum of light",
                                                  "evidence": "The cited work Power spectrum of light [1].", "search_query": "Mollow 188 1969"}])
+        self.assertNotIn("title", refs[0])
+        verbatim = [{**contextual[0], "text": "B. R. Mollow, Power spectrum of light, Physical Review 188, 1969 (1969)."}]
+        apply_reference_hints(refs, verbatim, [{"reference_id": "r1", "title": "Power spectrum of light",
+                                               "evidence": "Power spectrum of light", "search_query": "Mollow 188 1969"}])
         self.assertEqual(refs[0]["title"], "Power spectrum of light")
         self.assertEqual(refs[0]["title_source"], "Текст статьи")
+
+    def test_labelled_references_keep_year_lines_and_all_mentions(self):
+        parts = split_sections([
+            "Introduction\nFirst [Ber26a; BCG+\n23]. Again [Ber26a, Lemma 4]. Unknown [XBer26a].",
+            "References\n[Ber26a] Alice Reader. First result,\n2026. URL: https://example.org/first.\n2",
+            "[BCG+23] Bob Author. Second result. Journal, 2023.",
+        ])
+        first, second = bibliography(parts)
+        self.assertEqual((first["number"], second["number"]), ("Ber26a", "BCG+23"))
+        self.assertIn("2026. URL:", first["text"])
+        self.assertEqual(len({loc["anchor"] for loc in first["citations"]}), 2)
+        self.assertEqual(len(second["citations"]), 1)
+
+    def test_wrapped_year_and_caption_do_not_create_or_pollute_numbered_entries(self):
+        parts = split_sections(["References\n[1] Alice Reader. First title. Journal, 4:11,\n2020. doi:10.1234/first.\n"
+                                "TABLE XVI. A table drawn between the references.\nUnrelated row\n[2] Bob Writer. Second title. Journal, 2021."])
+        first, second = bibliography(parts)
+        self.assertEqual([first["number"], second["number"]], ["1", "2"])
+        self.assertIn("2020.", first["text"])
+        self.assertNotIn("Unrelated row", first["text"])
+
+    def test_unheaded_numbered_bibliography_does_not_invent_titles(self):
+        refs = bibliography(split_sections(["Conclusion\nThe calculation is complete.\n"
+            "1) A. Reader and Y . Author: Phys. Rev. Lett.96\n(2006) 060503.\n"
+            "2) B. Writer: arXiv:2610.00123.\n3) C. Editor: J. Phys. Soc. Jpn.5(1950) 435."]))
+        self.assertEqual(len(refs), 3)
+        self.assertTrue(all(_reference_item(ref)["missing_title"] for ref in refs))
+        self.assertEqual(_reference_item(refs[0])["authors"], "A. Reader and Y. Author")
+        chapters = split_sections(["1. Introduction\nEarlier work in 2000.\n2. Methods\nData from 2020.\n3. Results\nMeasurements in 2021."])
+        self.assertEqual(bibliography(chapters), [])
+
+    def test_reference_formats_separate_names_title_and_publication(self):
+        examples = (
+            ("Álvaro M. Alhambra. A quantum experiment. PRX Quantum, 4:040201, 2023.doi:10.1234/test.",
+             "Álvaro M. Alhambra", "A quantum experiment", "PRX Quantum, 4:040201 (2023)"),
+            ("Schuld M, Killoran N. Quantum Machine Learning in Feature Hilbert Spaces. Physical Review Letters. 2019;122(4):040504.",
+             "Schuld M, Killoran N", "Quantum Machine Learning in Feature Hilbert Spaces", "Physical Review Letters, 122(4):040504 (2019)"),
+            ('F. Tanaka and F. Komaki, “Bayesian predictive density operators,”Phys. Rev. A, vol. 71, 052323, 2005.doi:10.1234/test.',
+             "F. Tanaka and F. Komaki", "Bayesian predictive density operators", "Phys. Rev. A, vol. 71, 052323 (2005)"),
+            ("R. Alicki, M. Horodecki, and P. Horodecki. Thermal stability, 2008. URL: https://example.org/paper.",
+             "R. Alicki, M. Horodecki, and P. Horodecki", "Thermal stability", "(2008)"),
+            ("Gulrajani I, Lopez-Paz D. In Search of Lost Domain Generalization. In: International Conference on Learning Representations; 2021. Available from: https://example.org/paper.",
+             "Gulrajani I, Lopez-Paz D", "In Search of Lost Domain Generalization", "In: International Conference on Learning Representations (2021)"),
+            ("Victor Bapst et al. Unveiling the predictive power of static structure. Nature Physics, 16:448–454, 2020.",
+             "Victor Bapst et al", "Unveiling the predictive power of static structure", "Nature Physics, 16:448–454 (2020)"),
+        )
+        for source, authors, title, publication in examples:
+            with self.subTest(title=title):
+                item = _reference_item(entry(source))
+                self.assertEqual((item["authors"], item["label"], item["text"]), (authors, title, publication))
+
+    def test_url_and_doi_wrapping_and_confirmed_pdf_priority(self):
+        self.assertEqual(reference_text("https:\n//arxiv.\norg/abs/2610.\n12345"), "https://arxiv.org/abs/2610.12345")
+        self.assertEqual(reference_text("doi:10.1038/\ns41586-025-09583-x"), "doi:10.1038/s41586-025-09583-x")
+        ref = entry("A. Reader: Phys. Rev. Lett.96 (2006) 060503.")
+        source = {"DOI": "10.1234/test", "title": ["Verified publication"], "author": [{"family": "Reader"}],
+                  "published": {"date-parts": [[2006]]}, "volume": "96", "page": "060503",
+                  "short-container-title": ["Phys. Rev. Lett."],
+                  "link": [{"content-type": "application/pdf", "URL": "https://example.org/fulltext"}]}
+        http = Mock()
+        http.json.return_value = {"message": {"items": [source]}}
+        self.assertEqual(resolve_reference_titles(Publications(), http, [ref], Mock()), [])
+        self.assertEqual(ref["title"], "Verified publication")
+        self.assertEqual(ref["dois"], ["10.1234/test"])
+        self.assertEqual(ref["url"], "https://example.org/fulltext")
 
     def test_journal_abbreviations_need_matching_author_volume_page_and_year(self):
         data = {"DOI": "10.1234/bouquet", "title": ["A verified superconductivity paper"],

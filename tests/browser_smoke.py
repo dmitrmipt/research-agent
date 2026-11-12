@@ -155,8 +155,15 @@ def run(channel=None, screenshots=None):
             expect(page.locator("#new-effort")).to_have_value("medium")
             page.locator("#new-model").select_option("gpt-6.1-sol")
             page.locator("#new-effort").select_option("high")
+            page.locator("#depth").select_option("full")
             page.locator("#source").fill(FOCAL)
             page.locator("#questions").fill("Что измерено?")
+            presets = page.locator("[data-question]")
+            expect(presets).to_have_count(4)
+            question = presets.first.inner_text()
+            presets.first.click()
+            presets.first.click()
+            expect(page.locator("#questions")).to_have_value("Что измерено?\n" + question)
             page.locator("#start-button").click()
             expect(page.locator(".job-item")).to_have_count(1)
             first = fixture.call("/api/jobs")[0]
@@ -164,16 +171,25 @@ def run(channel=None, screenshots=None):
             assert result["status"] == "completed", result
             assert result["settings"]["model"] == "gpt-6.1-sol"
             assert result["settings"]["reasoning_effort"] == "high"
+            assert result["depth"] == "full"
             assert fixture.call("/api/settings")["model"] == "gpt-6-luna"
             expect(page.locator("#job-detail .result-state")).to_contain_text("Основной профиль готов")
             expect(page.locator("#job-detail")).to_contain_text("Расчётная стоимость")
             page.locator('#job-detail a[href^="#paper/"]').click()
             expect(page.locator("#paper-profile h1")).to_contain_text("Fixture focal article")
+            coverage = page.locator('[data-section="coverage"]')
+            coverage.locator(":scope > summary").click()
+            expect(coverage.locator(".step-list li")).to_have_count(5)
+            expect(coverage.locator(".coverage-facts")).to_contain_text("Выбран полный текст")
+            expect(coverage.locator('[data-section="coverage-details"] .profile-section-content')).to_be_hidden()
+            page.locator('[data-section="claims"] > summary').click()
+            expect(page.locator('[data-section="claims"] .profile-entry-summary')).to_contain_text("Экспериментальное измерение")
             page.locator('[data-section="answers"] > summary').click()
-            page.locator('[data-section="answers"] .profile-entry-summary').click()
+            page.locator('[data-section="answers"] .profile-entry-summary').first.click()
             expect(page.locator('[data-section="answers"]')).to_contain_text(QUOTE)
             page.get_by_role("button", name="Разобрать заново", exact=True).click()
             expect(page.locator("#analysis-dialog")).to_be_visible()
+            expect(page.locator("#analysis-depth")).to_have_value("full")
             page.locator("#analysis-model").fill("gpt-6.1-sol")
             page.locator("#analysis-effort").select_option("high")
             page.locator("#analysis-submit").click()

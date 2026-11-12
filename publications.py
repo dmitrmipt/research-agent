@@ -233,11 +233,14 @@ def crossref_record(record):
     resource = record.get("resource") or {}
     primary = resource.get("primary", {}) if isinstance(resource, dict) else {}
     publisher_url = web_link(primary.get("URL")) if isinstance(primary, dict) else ""
+    pdf_url = next((url for link in record.get("link") or [] if isinstance(link, dict)
+                    and str(link.get("content-type", "")).casefold() == "application/pdf"
+                    and (url := web_link(link.get("URL")))), "")
     return {"arxiv_id": "", "version": "", "doi": identifier, "title": title, "published": date,
             "authors": [compact(f'{a.get("given", "")} {a.get("family", "")}', 200)
                         for a in (record.get("author") or [])[:50] if isinstance(a, dict)],
             "abstract": compact(html.unescape(re.sub(r"<[^>]*>", " ", str(record.get("abstract") or ""))), 6000),
-            "url": doi_url(identifier), "publisher_url": publisher_url, "source": "Crossref",
+            "url": doi_url(identifier), "publisher_url": publisher_url, "pdf_url": pdf_url, "source": "Crossref",
             "publication": {"journal": compact(journals[0], 300) if isinstance(journals, list) and journals else "",
                             "volume": compact(record.get("volume"), 30), "issue": compact(record.get("issue"), 30),
                             "pages": compact(record.get("page") or record.get("article-number"), 80), "year": date[:4]}}
@@ -262,7 +265,10 @@ def _matches_citation(text, entry, work):
     year = work["published"][:4]
     if not (volume and page and year):
         return False
-    coordinates = re.search(rf" {re.escape(volume)}(?: \d{{1,3}})? {re.escape(page)} {re.escape(year)} ", text)
+    escaped_volume, escaped_page, escaped_year = map(re.escape, (volume, page, year))
+    coordinates = re.search(rf" (?:{escaped_volume}(?: \d{{1,3}})? {escaped_page} {escaped_year}|"
+                            rf"{escaped_volume} {escaped_year} {escaped_page}|"
+                            rf"{escaped_year} {escaped_volume}(?: \d{{1,3}})? {escaped_page}) ", text)
     if coordinates:
         before = text[:coordinates.start()].split()[-8:]
         for key in ("container-title", "short-container-title"):
@@ -349,7 +355,7 @@ class Publications:
         return message["items"]
 
     def crossref_citation(self, http, citation, query=None):
-        fields = "container-title,short-container-title,volume,issue,page,article-number,resource"
+        fields = "container-title,short-container-title,volume,issue,page,article-number,resource,link"
         text = " " + _citation_words(citation) + " "
         matches = {work["doi"]: work for entry in self._crossref_items(http, compact(query or citation, 600), 3, fields)
                    if (work := crossref_record(entry)) and _matches_citation(text, entry, work)}
@@ -366,7 +372,7 @@ def object_schema(**properties):
 
 
 STRING = {"type": "string"}
-KIND = {"type": "string", "enum": ["measurement", "calculation", "interpretation", "other"]}
+KIND = {"type": "string", "enum": ["measurement", "calculation", "simulation", "data_analysis", "interpretation", "other"]}
 
 
 def array(items):
@@ -416,7 +422,7 @@ class Model:
             payload["reasoning"] = {"effort": effort}
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         if len(raw) > MAX_PROMPT_BYTES:
-            raise ServiceError("Запрос к модели превышает установленный предел входных данных.")
+            raise ServiceError("Запрос к модели слишком велик. Выберите меньший охват текста и запустите разбор заново.")
         self.http.checkpoint()
         self.start_call()
         response = self.http.json(RESPONSES, "OpenAI", data=raw, timeout=75,
