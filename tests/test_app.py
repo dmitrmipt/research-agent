@@ -161,6 +161,21 @@ class AppTest(unittest.TestCase):
             self.assertIn('Новый разбор', response.read().decode())
             self.assertIn("frame-ancestors 'none'", response.headers['Content-Security-Policy'])
 
+    def test_local_fonts_are_served_without_exposing_other_files(self):
+        for name, mime, signature in (
+            ('InterVariable.woff2', 'font/woff2', b'wOF2'),
+            ('PTSerif-Regular.ttf', 'font/ttf', b'\x00\x01\x00\x00'),
+            ('PTSerif-Bold.ttf', 'font/ttf', b'\x00\x01\x00\x00'),
+        ):
+            with self.subTest(font=name), urlopen(self.url + '/fonts/' + name) as response:
+                self.assertEqual(response.headers.get_content_type(), mime)
+                self.assertEqual(response.headers['X-Content-Type-Options'], 'nosniff')
+                self.assertTrue(response.read().startswith(signature))
+        for path in ('/fonts/unknown.ttf', '/fonts/../app.py', '/fonts/%2e%2e%2fapp.py'):
+            with self.subTest(path=path), self.assertRaises(HTTPError) as error:
+                urlopen(self.url + path)
+            self.assertEqual(error.exception.code, 404)
+
     def test_second_instance_cannot_interrupt_jobs(self):
         job = self.create()
         self.wait_status(job['id'], ['running'])

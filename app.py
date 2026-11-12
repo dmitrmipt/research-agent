@@ -742,6 +742,8 @@ class Handler(BaseHTTPRequestHandler):
         request = urlparse(self.path)
         path = request.path
         static = {"/": ("index.html", "text/html; charset=utf-8"), "/app.js": ("app.js", "text/javascript; charset=utf-8"), "/style.css": ("style.css", "text/css; charset=utf-8")}
+        static.update({"/fonts/" + name: ("fonts/" + name, mime) for name, mime in (
+            ("InterVariable.woff2", "font/woff2"), ("PTSerif-Regular.ttf", "font/ttf"), ("PTSerif-Bold.ttf", "font/ttf"))})
         if path in static:
             name, mime = static[path]
             return self.respond(200, (ROOT / "static" / name).read_bytes(), mime)

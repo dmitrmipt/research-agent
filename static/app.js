@@ -2,7 +2,7 @@
 const $ = id => document.getElementById(id);
 const statusNames = {queued:"В очереди",running:"Выполняется",completed:"Завершено",cancelled:"Остановлено",failed:"Ошибка",interrupted:"Прервано"};
 const depthNames = {brief:"16 000 символов",standard:"30 000 символов",deep:"48 000 символов"};
-const stepNames = {material:"Материалы и текст",core:"Основной профиль",references:"Библиография",analogs:"Поиск аналогов",manuscript:"Исходник рукописи"};
+const stepNames = {material:"Материал",core:"Обзор",references:"Библиография",analogs:"Аналоги",manuscript:"Исходник"};
 const stepStates = {pending:"Ожидает",running:"Выполняется",completed:"Готово",failed:"Ошибка",skipped:"Пропущено",blocked:"Требуется действие",not_applicable:"Не требуется"};
 const effortNames = {auto:"По умолчанию модели",none:"Без дополнительного рассуждения",low:"Низкое · low",medium:"Среднее · medium",high:"Высокое · high",xhigh:"Очень высокое · xhigh",max:"Максимальное · max"};
 let catalog = null, catalogRequested = false, savedSettings = null, analysisContext = null;
@@ -24,6 +24,8 @@ async function api(path, body){
 }
 function navigate(){
   const previousPage = currentPage;
+  const previousProfile = profileId;
+  setLibraryShortcuts(false);
   const path = location.hash.slice(1) || "new";
   const match = /^paper\/([a-f0-9]{32})$/.exec(path);
   currentPage = match ? "paper" : path;
@@ -37,6 +39,7 @@ function navigate(){
   const navPage = currentPage === "paper" ? "library" : currentPage;
   document.querySelectorAll("nav a[data-page]").forEach(node=>{const active=node.dataset.page===navPage;node.classList.toggle("active",active);if(active)node.setAttribute("aria-current","page");else node.removeAttribute("aria-current");});
   markLibraryShortcut();
+  if (previousPage !== currentPage || previousProfile !== profileId) window.scrollTo(0, 0);
   if (currentPage === "new" && previousPage !== "new" && !newModelEdited && savedSettings) fillNewModels(savedSettings.model, savedSettings.reasoning_effort);
   if (currentPage === "settings" && !catalogRequested) { catalogRequested = true; loadCatalog(true); }
   refresh();
@@ -81,7 +84,7 @@ $("new-form").addEventListener("submit",async event=>{
   }catch(error){notify(error.message,true);}finally{button.disabled=false;renderMode();}
 });
 function badge(status){return el("span",statusNames[status]||status,"badge "+status);}
-function empty(title,subtitle){const div=el("div",undefined,"empty");div.append(el("span","◎"),el("h2",title),el("p",subtitle));return div;}
+function empty(title,subtitle){const div=el("div",undefined,"empty");div.append(el("h2",title),el("p",subtitle));return div;}
 function renderJobs(){
   const active=jobs.filter(job=>["running","queued"].includes(job.status)).length;
   const completed=jobs.filter(job=>job.status==="completed").length;
@@ -119,14 +122,21 @@ function apiUsage(usage) {
     + (unknown ? ` · нет данных о токенах по ${unknown} вызовам` : "");
 }
 function stepsView(steps) {
-  const list = el("ul", undefined, "step-list");
+  const section = el("section", undefined, "processing-stages");
+  section.setAttribute("aria-label", "Этапы обработки");
+  const list = el("ol", undefined, "step-list");
+  const notes = el("dl", undefined, "step-notes");
   for (const [key, step] of Object.entries(steps || {})) {
     const row = el("li", undefined, "step-state-" + step.status);
-    row.append(el("strong", stepNames[key] || key), el("span", stepStates[step.status] || step.status));
-    if (step.message) row.append(el("p", step.message));
+    const symbol = el("span", {completed:"✓", running:"·", failed:"!", blocked:"!", skipped:"−", not_applicable:"−"}[step.status] || "", "step-symbol");
+    symbol.setAttribute("aria-hidden", "true");
+    row.append(symbol, el("strong", stepNames[key] || key), el("span", stepStates[step.status] || step.status, "step-status"));
+    if (step.message) notes.append(el("dt", stepNames[key] || key), el("dd", step.message));
     list.append(row);
   }
-  return list;
+  section.append(list);
+  if (notes.childElementCount) section.append(notes);
+  return section;
 }
 function retryButton(job) {
   const button = el("button", "Продолжить разбор", "primary");
@@ -143,10 +153,15 @@ async function renderDetail(){
   const requested=selectedJob, job=await api("/api/jobs/"+requested);
   if(requested!==selectedJob)return;
   const key=job.id+job.updated;if(detailKey===key)return;detailKey=key;
-  const panel=$("job-detail");const expanded=panel.querySelector("details")?.open;const reportScroll=panel.querySelector(".report")?.scrollTop||0;panel.replaceChildren();
+  const panel=$("job-detail");
+  const expanded = panel.dataset.jobId === job.id
+    ? Object.fromEntries([...panel.querySelectorAll("details[data-job-disclosure]")].map(node => [node.dataset.jobDisclosure, node.open])) : {};
+  const reportScroll=panel.querySelector(".report")?.scrollTop||0;panel.replaceChildren();panel.dataset.jobId=job.id;
   const heading=el("div",undefined,"detail-heading");heading.append(el("h2",job.title),badge(job.status));panel.append(heading,el("div",date(job.created)+" · № "+job.id.slice(0,8),"subtle"));
-  panel.append(el("div",job.stage+" · "+job.progress+"%","stage-line"));
-  const progress=el("progress",undefined,"progress");progress.max=100;progress.value=job.progress;progress.setAttribute("aria-label","Ход обработки");panel.append(progress);
+  if (["queued", "running"].includes(job.status) || job.mode === "demo") {
+    panel.append(el("div",job.stage+" · "+job.progress+"%","stage-line"));
+    const progress=el("progress",undefined,"progress");progress.max=100;progress.value=job.progress;progress.setAttribute("aria-label","Ход обработки");panel.append(progress);
+  }
   const actions=el("div",undefined,"detail-actions");
   if(["running","queued"].includes(job.status)){
     const cancel=el("button","Остановить задание","secondary danger");cancel.type="button";
@@ -162,7 +177,7 @@ async function renderDetail(){
   }
   panel.append(actions);
   if (job.mode === "research") {
-    panel.append(el("p", job.result_status === "ready" ? "Основной профиль готов и сохранён." : job.result_status === "partial" ? "Сохранён частичный результат." : job.steps.material?.status === "completed" ? "Материалы и текст сохранены. Обзор ещё не подготовлен." : "Новый профиль пока не сохранён.", "result-state"));
+    panel.append(el("p", job.result_status === "ready" ? "Основной профиль готов и сохранён." : job.result_status === "partial" ? "Сохранён частичный результат." : job.steps.material?.status === "completed" ? "Материалы и текст сохранены. Обзор ещё не подготовлен." : "Новый профиль пока не сохранён.", "result-state" + (job.result_status === "partial" ? " partial" : "")));
     if (job.retry?.allowed) panel.append(el("p", `Продолжение: ${job.retry.steps.join(", ")}. ${job.retry.model_needed ? "Возможны вызовы модели и расходы API." : "Вызов модели не требуется."}`, "hint"));
     else if (job.retry?.message && Object.values(job.steps).some(step => step.code === "no_text")) panel.append(el("p", job.retry.message, "hint"));
     panel.append(stepsView(job.steps));
@@ -176,10 +191,11 @@ async function renderDetail(){
   if (job.resolved_version) panel.append(el("p", "Версия arXiv для этого задания: " + job.resolved_version, "subtle"));
   panel.append(el("p", apiUsage(job.api_usage), "subtle"));
   if (job.api_usage.calls) panel.append(el("p", job.estimated_cost === null ? "Расчётная стоимость неизвестна: недостаточно данных." : `Расчётная стоимость: $${job.estimated_cost.toFixed(6)} · тариф ${job.settings.pricing?.date || ""} (Standard).`, "subtle"));
-  panel.append(el("h2","Журнал этапов"));const events=el("ol",undefined,"events");
-  job.events.forEach(event=>{const line=el("li");line.append(el("time",new Date(event.time).toLocaleTimeString("ru-RU")),el("span",event.message));events.append(line);});panel.append(events);
+  const history=el("details",undefined,"job-disclosure job-history");history.dataset.jobDisclosure="history";history.open=Boolean(expanded.history);
+  history.append(el("summary","Журнал этапов"));const events=el("ol",undefined,"events");
+  job.events.forEach(event=>{const line=el("li");line.append(el("time",new Date(event.time).toLocaleTimeString("ru-RU")),el("span",event.message));events.append(line);});history.append(events);panel.append(history);
   if(job.report){panel.append(el("h2","Результат · демонстрационный шаблон"),el("pre",job.report,"report"));panel.querySelector(".report").scrollTop=reportScroll;}
-  const details=el("details");details.open=Boolean(expanded);details.append(el("summary","Параметры и снимок настроек"));
+  const details=el("details",undefined,"job-disclosure job-settings");details.dataset.jobDisclosure="settings";details.open=Boolean(expanded.settings);details.append(el("summary","Параметры и снимок настроек"));
   const settings=job.settings;details.append(el("div",[
     "Источник: "+job.input_source,"Охват: "+depthNames[job.depth],"Усилие: "+(effortNames[settings.reasoning_effort] || settings.reasoning_effort),
     "Режим: "+(job.mode === "research" ? "Первичная обработка" : "Демонстрация"),
@@ -258,11 +274,19 @@ function renderLibraryShortcuts(papers) {
 }
 
 $("library-toggle").addEventListener("click", () => setLibraryShortcuts($("library-shortcuts").hidden));
-$("library-shortcuts").addEventListener("keydown", event => {
-  if (event.key === "Escape") {
+document.addEventListener("click", event => {
+  if (!event.target.closest(".library-nav")) setLibraryShortcuts(false);
+});
+document.addEventListener("keydown", event => {
+  if (event.key === "Escape" && !$("library-shortcuts").hidden) {
     setLibraryShortcuts(false);
     $("library-toggle").focus();
   }
+});
+document.querySelector(".skip-link").addEventListener("click", event => {
+  event.preventDefault();
+  $("main-content").focus();
+  $("main-content").scrollIntoView({block:"start"});
 });
 
 function profileDetails(id, key, className, initiallyOpen = false) {
@@ -401,7 +425,8 @@ async function renderProfile() {
   const label = paper.kind === "arxiv" ? paper.source.replace("arxiv:", "ARXIV · ") : "ЛОКАЛЬНЫЙ PDF";
   heading.append(el("div", profile?.article.version ? `${label} · ${profile.article.version}` : label, "eyebrow"),
     el("h1", profile?.article.title ?? paper.title));
-  if (profile) heading.append(el("p", `Профиль подготовлен ${date(profile.prepared_at)}.`));
+  if (profile?.article.authors?.length) heading.append(el("p", profile.article.authors.join(", "), "profile-authors"));
+  if (profile) heading.append(el("p", `Профиль подготовлен ${date(profile.prepared_at)}.`, "subtle"));
   const actions = el("div", undefined, "detail-actions profile-actions");
   const base = `/api/papers/${id}`;
   const snapshot = profile ? "?snapshot=" + encodeURIComponent(profile.revision || profile.job_id) : "";
@@ -461,7 +486,9 @@ async function renderProfile() {
     });
     folder.append(copy);
   }
-  panel.append(folder, ...paper.sections.map(section => profileSection(section, id, pdfUrl)));
+  const storage = profileDetails(id, "storage", "profile-storage");
+  storage.append(el("summary", "Файлы на этом компьютере"), folder);
+  panel.append(...paper.sections.map(section => profileSection(section, id, pdfUrl)), storage);
 }
 
 function effortsFor(model, select, value = "auto") {
