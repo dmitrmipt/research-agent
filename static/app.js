@@ -6,6 +6,7 @@ const stepNames = {material:"Материалы и текст",core:"Основ�
 const stepStates = {pending:"Ожидает",running:"Выполняется",completed:"Готово",failed:"Ошибка",skipped:"Пропущено",blocked:"Требуется действие",not_applicable:"Не требуется"};
 const effortNames = {auto:"По умолчанию модели",none:"Без дополнительного рассуждения",low:"Низкое · low",medium:"Среднее · medium",high:"Высокое · high",xhigh:"Очень высокое · xhigh",max:"Максимальное · max"};
 let catalog = null, catalogRequested = false, savedSettings = null, analysisContext = null;
+let newModelEdited = false;
 let currentPage = "new", sourceType = "arxiv", selectedJob = null, paperFilter = null;
 let jobs = [], detailKey = "", jobListKey = "", paperListKey = "", busy = false, noticeTimer;
 let profileId = null, profileKey = "", demoSeconds = 3, health = null;
@@ -22,6 +23,7 @@ async function api(path, body){
   return data;
 }
 function navigate(){
+  const previousPage = currentPage;
   const path = location.hash.slice(1) || "new";
   const match = /^paper\/([a-f0-9]{32})$/.exec(path);
   currentPage = match ? "paper" : path;
@@ -35,6 +37,7 @@ function navigate(){
   const navPage = currentPage === "paper" ? "library" : currentPage;
   document.querySelectorAll("nav a[data-page]").forEach(node=>{const active=node.dataset.page===navPage;node.classList.toggle("active",active);if(active)node.setAttribute("aria-current","page");else node.removeAttribute("aria-current");});
   markLibraryShortcut();
+  if (currentPage === "new" && previousPage !== "new" && !newModelEdited && savedSettings) fillNewModels(savedSettings.model, savedSettings.reasoning_effort);
   if (currentPage === "settings" && !catalogRequested) { catalogRequested = true; loadCatalog(true); }
   refresh();
 }
@@ -67,13 +70,14 @@ function showJob(job) {
 $("new-form").addEventListener("submit",async event=>{
   event.preventDefault(); const button=$("start-button");button.disabled=true;button.textContent="Сохранение…";
   try{
-    const body={source:$("source").value,questions:$("questions").value,depth:$("depth").value,mode:$("mode").value};
+    const body={source:$("source").value,questions:$("questions").value,depth:$("depth").value,mode:$("mode").value,
+      settings:{model:$("new-model").value,reasoning_effort:$("new-effort").value}};
     if (body.mode === "demo") body.scenario = $("scenario").value;
     if(sourceType==="pdf"){
       const file=$("pdf").files[0];if(!file)throw new Error("Выберите PDF.");if(file.size>15*1024*1024)throw new Error("Максимальный размер PDF — 15 МБ.");
       body.pdf={name:file.name,data:await fileData(file)};
     }
-    showJob(await api("/api/jobs", body));
+    showJob(await api("/api/jobs", body)); newModelEdited = false;
   }catch(error){notify(error.message,true);}finally{button.disabled=false;renderMode();}
 });
 function badge(status){return el("span",statusNames[status]||status,"badge "+status);}
@@ -412,6 +416,7 @@ async function renderProfile() {
       actions.append(link("Открыть исходник .tex", base + "/manuscript.html" + snapshot, "secondary", true));
     }
     if (profile.content.summary.length) addJobAction("Повторить поиск аналогов", "analogs");
+    if (profile.content.references?.length) addJobAction("Уточнить библиографию", "references");
     const reanalyze = el("button", "Разобрать заново", "secondary warm-action"); reanalyze.type = "button";
     reanalyze.disabled = ["queued", "running"].includes(job?.status);
     reanalyze.onclick = () => openAnalysis("reanalyze", paper);
@@ -457,13 +462,22 @@ function effortsFor(model, select, value = "auto") {
   select.value = values.includes(value) ? value : "auto";
 }
 function priceText(spec) {
-  return spec?.pricing ? `Вход $${spec.pricing.input} · выход $${spec.pricing.output} / 1 млн токенов` : "Цена неизвестна";
+  return spec?.pricing ? `$${spec.pricing.input} / $${spec.pricing.output} за 1 млн` : "Цена неизвестна";
 }
+function fillNewModels(model = $("new-model").value, effort = $("new-effort").value) {
+  const specs = (catalog?.models || []).filter(item => item.available !== false || item.id === model);
+  const options = specs.map(spec => { const option = el("option", spec.name); option.value = spec.id; return option; });
+  if (!options.some(option => option.value === model)) { const custom = el("option", model); custom.value = model; options.push(custom); }
+  $("new-model").replaceChildren(...options); $("new-model").value = model;
+  effortsFor(model, $("new-effort"), effort || "auto");
+}
+$("new-model").onchange = () => { newModelEdited = true; effortsFor($("new-model").value, $("new-effort"), $("new-effort").value); };
+$("new-effort").onchange = () => { newModelEdited = true; };
 function chooseModel(model, effort = "auto") {
   $("model").value = model;
   $("manual-model").value = model;
   const spec = catalog?.models.find(item => item.id === model);
-  $("model-caption").textContent = spec?.name || model;
+  $("model-caption").textContent = (spec?.name || model) + " · " + priceText(spec);
   effortsFor(model, $("reasoning_effort"), effort);
   const pricing = $("model-pricing"); pricing.replaceChildren();
   if (spec?.pricing) {
@@ -480,8 +494,8 @@ function renderModelOptions() {
   const rows = (catalog?.models || []).filter(item => (item.name + " " + item.id).toLowerCase().includes(query)).map(spec => {
     const option = el("button", undefined, "model-option"); option.type = "button"; option.setAttribute("role", "option");
     option.setAttribute("aria-selected", String(spec.id === $("model").value)); option.disabled = spec.available === false;
-    option.append(el("strong", spec.name), el("small", spec.id), el("span", priceText(spec)),
-      el("small", spec.available === false ? "Не получена в списке по ключу" : spec.available === true ? "Есть в списке по ключу" : "Доступ по ключу ещё не проверен"));
+    option.append(el("span", spec.name, "model-option-name"), el("span", priceText(spec), "model-option-price"));
+    option.title = spec.id + (spec.available === false ? " · Нет в списке по ключу" : spec.available === true ? " · Есть в списке по ключу" : " · Доступ ещё не проверен");
     option.onclick = () => { chooseModel(spec.id); closeModelPicker(); $("settings-state").textContent = "Есть несохранённые изменения"; };
     return option;
   });
@@ -511,6 +525,7 @@ async function loadCatalog(remote = false) {
     const data = await api(remote ? "/api/models/refresh" : "/api/models", remote ? {} : undefined);
     if (!remote && catalog?.checked_at && (!data.checked_at || data.checked_at < catalog.checked_at)) return;
     catalog = data;
+    fillNewModels();
     $("catalog-state").textContent = data.error ? data.error + (data.checked_at ? " Показан последний полученный список." : " Показан справочный каталог.") :
       data.checked_at ? `Список получен ${date(data.checked_at)}. Выполнение анализа для этих моделей ещё не проверялось.` : "Справочный каталог. Обновите список для проверки доступа по ключу.";
     $("other-models").textContent = data.other_models.length ? "Другие идентификаторы по ключу (совместимость не проверена): " + data.other_models.join(", ") : "";
@@ -568,7 +583,7 @@ $("analysis-form").onsubmit = async event => {
 
 const settingKeys=["interests","exclusions","rules","language","stage_seconds","time_limit_seconds","model","reasoning_effort","max_api_calls","max_output_tokens"];
 const numericSettings = new Set(["stage_seconds", "time_limit_seconds", "max_api_calls", "max_output_tokens"]);
-async function loadSettings(){const settings=await api("/api/settings");savedSettings=settings;for(const key of settingKeys)if(key!=="reasoning_effort")$(key).value=settings[key];await loadCatalog();chooseModel(settings.model,settings.reasoning_effort);demoSeconds=settings.stage_seconds;renderMode();}
+async function loadSettings(){const settings=await api("/api/settings");savedSettings=settings;for(const key of settingKeys)if(key!=="reasoning_effort")$(key).value=settings[key];await loadCatalog();chooseModel(settings.model,settings.reasoning_effort);fillNewModels(settings.model,settings.reasoning_effort);demoSeconds=settings.stage_seconds;renderMode();}
 async function loadHealth() {
   health = await api("/api/health");
   if (health.version) {
@@ -584,7 +599,7 @@ async function loadHealth() {
 }
 $("settings-form").addEventListener("submit",async event=>{
   event.preventDefault();const button=event.target.querySelector("button[type=submit]");button.disabled=true;
-  try{const data={};for(const key of settingKeys)data[key]=numericSettings.has(key)?Number($(key).value):$(key).value;await api("/api/settings",data);demoSeconds=data.stage_seconds;renderMode();$("settings-state").textContent="Сохранено · "+new Date().toLocaleTimeString("ru-RU");notify("Настройки сохранены. Активные задания используют прежние настройки.");}catch(error){notify(error.message,true);}finally{button.disabled=false;}
+  try{const data={};for(const key of settingKeys)data[key]=numericSettings.has(key)?Number($(key).value):$(key).value;await api("/api/settings",data);savedSettings=data;if(!newModelEdited)fillNewModels(data.model,data.reasoning_effort);demoSeconds=data.stage_seconds;renderMode();$("settings-state").textContent="Сохранено · "+new Date().toLocaleTimeString("ru-RU");notify("Настройки сохранены. Активные задания используют прежние настройки.");}catch(error){notify(error.message,true);}finally{button.disabled=false;}
 });
 $("settings-form").addEventListener("input",()=>$("settings-state").textContent="Есть несохранённые изменения");
 function showAllJobs() {

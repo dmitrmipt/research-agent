@@ -29,6 +29,8 @@ def run():
             page.keyboard.press("ArrowDown")
             page.locator("#model-search").fill("luna")
             expect(page.locator(".model-option")).to_have_count(1)
+            assert page.locator(".model-option").bounding_box()["height"] < 60
+            assert page.locator(".model-option small").count() == 0
             page.keyboard.press("ArrowDown")
             page.keyboard.press("Enter")
             expect(page.locator("#model-popup")).to_be_hidden()
@@ -38,6 +40,10 @@ def run():
             expect(page.locator("#settings-state")).to_contain_text("Сохранено")
             page.screenshot(path=str(Path(tempfile.gettempdir()) / "research-agent-030-settings.png"), full_page=True)
             page.locator('nav a[data-page="new"]').click()
+            expect(page.locator("#new-model")).to_have_value("gpt-6-luna")
+            expect(page.locator("#new-effort")).to_have_value("medium")
+            page.locator("#new-model").select_option("gpt-6.1-sol")
+            page.locator("#new-effort").select_option("high")
             page.locator("#source").fill(FOCAL)
             page.locator("#questions").fill("Что измерено?")
             page.locator("#start-button").click()
@@ -45,6 +51,9 @@ def run():
             first = fixture.call("/api/jobs")[0]
             result = fixture.settled(first)
             assert result["status"] == "completed", result
+            assert result["settings"]["model"] == "gpt-6.1-sol"
+            assert result["settings"]["reasoning_effort"] == "high"
+            assert fixture.call("/api/settings")["model"] == "gpt-6-luna"
             expect(page.locator("#job-detail .result-state")).to_contain_text("Основной профиль готов")
             expect(page.locator("#job-detail")).to_contain_text("Расчётная стоимость")
             page.locator('#job-detail a[href^="#paper/"]').click()
@@ -75,6 +84,9 @@ def run():
             page.set_viewport_size({"width": 390, "height": 844})
             page.screenshot(path=str(Path(tempfile.gettempdir()) / "research-agent-030-mobile.png"), full_page=True)
             assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), "Mobile horizontal overflow"
+            page.locator('nav a[data-page="new"]').click()
+            expect(page.locator("#new-model")).to_have_value("gpt-6-luna")
+            expect(page.locator("#new-effort")).to_have_value("medium")
             assert not errors, errors
             browser.close()
         print("Browser checks passed: models, keyboard, settings, analysis, citations, reanalysis, continuation, mobile.")

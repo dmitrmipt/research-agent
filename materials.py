@@ -15,13 +15,14 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 
 from manuscripts import SOURCE_FILES
+from bibliographic import reference_text
 from version import VERSION
 
 PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
 MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
-PROFILE_VERSION = 6
+PROFILE_VERSION = 7
 EXTRACTION_VERSION = 1
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
@@ -455,7 +456,8 @@ def _reference_item(entry):
     chunks = [chunk.strip() for chunk in entry["text"].split(",")]
     author_count = 0
     for chunk in chunks:
-        if REFERENCE_AUTHOR.match(chunk) or (author_count and chunk.casefold() == "et al."):
+        name = re.sub(r"(?<=\w)[-´`]\s+(?=\w)", "", re.sub(r"^and\s+", "", chunk))
+        if (REFERENCE_AUTHOR.match(chunk) and full_author_names(name)) or (author_count and chunk.casefold() == "et al."):
             author_count += 1
         else:
             break
@@ -463,7 +465,8 @@ def _reference_item(entry):
     citation = ", ".join(chunks[author_count:])
     name_line, dot, remainder = citation.partition(". ")
     year = ""
-    author_year = AUTHOR_YEAR_START.match(entry["text"])
+    author_year = (AUTHOR_YEAR_START.match(entry["text"])
+                   if not re.match(r"^(?:and\s+)?[A-ZА-ЯЁ]\.", entry["text"]) else None)
     if author_year:
         authors, year = author_year[0].rsplit("(", 1)
         authors, year = authors.strip(" ,"), year[:4]
@@ -482,17 +485,22 @@ def _reference_item(entry):
             name, comma, venue = remaining.rpartition(", ")
             title, details = (name, venue) if comma else (remaining, details)
             year = trailing_year
+    title = title.strip(" ,;.")
+    if (REFERENCE_LINK_LINE.match(title) or re.match(r"^(?:and\s+)?[A-ZА-ЯЁ]\.\s", title)
+            or re.match(r"^(?:Nature(?:\s*\([^)]*\))?|Science|Phys(?:ical)?\.?\s*Rev(?:iew)?\.?[^,]*)\s*\d", title, re.I)):
+        title = ""
+    if not title and not details:
+        details = citation
     details, year = _reference_publication(entry, details, year)
-    label = entry.get("title") or title
-    if not label:
-        label, details = details or entry["text"], ""
+    missing = not (entry.get("title") or title)
+    label = entry.get("title") or title or "Название не установлено"
     citations = []
     for location in entry.get("citations", []):
         page, section = location["page"], location["section"]
         label_suffix = f" · {section}" if section != "Основной текст" else ""
         citations.append({"page": page, "label": f"с. {page}{label_suffix}"})
     return {"label": label, "text": " ".join(filter(None, (details, year))), "href": web_link(entry["url"]),
-            "number": entry["number"], "authors": authors, "citations": citations}
+            "number": entry["number"], "authors": authors, "citations": citations, "missing_title": missing}
 
 
 def _analog_pdf_page(analog):
@@ -530,11 +538,16 @@ def profile_sections(profile):
                       item("Фокус внимания", profile["questions"] or "Не указан"),
                       item("API", f'{usage["model"] or "Модель не вызывалась"} · запросов: {usage["calls"]} · вход: {usage["input_tokens"]} · выход: {usage["output_tokens"]} токенов')]
     selection = coverage.get("selection")
+    if profile.get("reference_search_note"):
+        coverage_items.append(item("Уточнение названий", profile["reference_search_note"]))
     if selection:
         coverage_items.append(item("Передано модели", f'{selection["selected_fragments"]} из {selection["available_fragments"]} фрагментов; '
                                    f'{selection["selected_chars"]} из {selection["available_chars"]} символов. '
                                    f'Бюджет: {selection["budget_chars"]}.'))
-        coverage_items.append(item("Страницы, переданные модели", ", ".join(map(str, selection["pages"])) or "Только аннотация"))
+        coverage_items.append(item("Страницы основных фрагментов", ", ".join(map(str, selection["pages"])) or "Только аннотация"))
+        if selection.get("reference_records"):
+            coverage_items.append(item("Дополнительно для библиографии", f'{selection["reference_records"]} записей и контекст цитирования; страницы '
+                                       + ", ".join(map(str, selection["reference_pages"]))))
         coverage_items.append(item("Отбор текста", "Общий охват и фрагменты по вопросам (локальный поиск по терминам)."
                                    if selection["question_focused"] else "Общий охват разделов статьи."))
     for key, step in profile.get("steps", {}).items():

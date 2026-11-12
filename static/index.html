@@ -48,7 +48,12 @@
           <div><label for="depth">Охват текста статьи</label><select id="depth"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option></select></div>
           <div><label for="mode">Режим</label><select id="mode"><option value="research">Подготовить профиль</option><option value="demo">Демонстрация</option></select></div>
         </div>
-        <p class="hint">Короткая статья передаётся целиком. Для длинной выбираются фрагменты до 2000 символов с перекрытием до 200: общий охват и материал по вашим вопросам. Усилие модели задаётся отдельно в настройках.</p>
+        <p class="hint">Короткая статья передаётся целиком. Для длинной выбираются фрагменты до 2000 символов с перекрытием до 200: общий охват и материал по вашим вопросам. Усилие модели выбирается отдельно ниже.</p>
+        <div class="field-row new-model-fields">
+          <div><label for="new-model">Модель для этой статьи</label><select id="new-model"><option value="gpt-6-luna">GPT-6 Luna</option></select></div>
+          <div><label for="new-effort">Усилие анализа</label><select id="new-effort"><option value="low">Низкое · low</option></select></div>
+        </div>
+        <p class="hint" id="new-model-note">Начальные значения берутся из настроек. Выбор здесь применяется только к этой статье.</p>
         <div id="demo-options" hidden><label for="scenario">Сценарий демонстрации</label><select id="scenario"><option value="success">Успешное завершение</option><option value="error">Ошибка на этапе поиска</option></select></div>
         <p class="hint" id="processing-note">Фрагменты текста и ваши вопросы передаются в OpenAI, поисковые термины — в arXiv и Crossref. Вызовы модели могут расходовать средства API.</p>
         <p class="hint" id="setup-state" role="status"></p>
@@ -90,7 +95,7 @@
         <label for="rules">Правила чтения</label><textarea id="rules" rows="5" maxlength="12000"></textarea>
         <label for="language">Язык обзора</label><select id="language"><option>Русский</option><option>English</option></select>
         <div class="form-divider"></div><h2>Модель и ограничения</h2>
-        <div class="model-heading"><label id="model-label">Модель анализа</label><button type="button" id="models-refresh" class="secondary">Обновить список</button></div>
+        <div class="model-heading"><label id="model-label">Модель по умолчанию</label><button type="button" id="models-refresh" class="secondary">Обновить список</button></div>
         <input id="model" type="hidden" value="gpt-6-luna">
         <div class="model-picker-wrap">
           <button type="button" id="model-picker" class="model-picker" aria-haspopup="listbox" aria-expanded="false" aria-controls="model-options" aria-labelledby="model-label model-caption"><span id="model-caption">Загрузка каталога…</span><span aria-hidden="true">⌄</span></button>

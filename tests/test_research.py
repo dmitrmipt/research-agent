@@ -210,7 +210,7 @@ class ResearchTest(TempTest):
             if parts.path == "/v1/models":
                 if self.fail_catalog:
                     raise ServiceError("OpenAI: HTTP 401.", status=401)
-                return json.dumps({"data": [{"id": "gpt-6-luna"}, {"id": "text-embedding-3-small"}]}).encode()
+                return json.dumps({"data": [{"id": "gpt-6-luna"}, {"id": "gpt-6.1-sol"}, {"id": "text-embedding-3-small"}]}).encode()
             self.assertEqual(parts.path, "/v1/responses")
             self.assertEqual(kwargs["headers"]["Authorization"], "Bearer fixture-key")
             request = json.loads(kwargs["data"])
@@ -220,6 +220,9 @@ class ResearchTest(TempTest):
             self.assertFalse(request["store"])
             self.assertTrue(request["text"]["format"]["strict"])
             inputs = json.loads(request["input"])
+            if request["text"]["format"]["name"] == "reference_titles":
+                return responses({"reference_hints": [{"reference_id": entry["reference_id"], "title": "", "evidence": "",
+                                                        "search_query": entry["text"]} for entry in inputs["references"]]})
             if request["text"]["format"]["name"] == "article_profile":
                 self.model_arrived.set()
                 self.resume_model.wait(8)
@@ -243,7 +246,7 @@ class ResearchTest(TempTest):
                                                for term, weight in [("microwave", 5), ("probe", 4), ("calibration", 3), ("spectra", 2), ("temperature", 1)]],
                                   "topics": ["Микроволновые измерения"],
                                   "claims": [claim, {**claim, "statement": "Выдуманное утверждение.", "evidence": "A fabricated sentence."}],
-                                  "search_terms": ["microwave probe", "superconducting spectra"]})
+                                  "search_terms": ["microwave probe", "superconducting spectra"], "reference_hints": []})
             if self.empty_analogs:
                 return responses({"analogs": []})
             self.assertNotIn("evidence", request["text"]["format"]["schema"]["properties"]["analogs"]["items"]["properties"])
@@ -725,8 +728,93 @@ class ResearchTest(TempTest):
         self.assertEqual(resumed["status"], "queued")
         self.assertEqual(resumed["input_revision"], queued["input_revision"])
 
+    def test_new_job_can_override_model_and_effort_without_changing_defaults(self):
+        first = self.uploaded(pdf_bytes("Per article model"), settings={"model": "gpt-6.1-sol", "reasoning_effort": "high", "max_api_calls": 1})
+        result = self.settled(first)
+        self.assertEqual(result["status"], "completed", result["error"])
+        self.assertEqual(result["settings"]["model"], "gpt-6.1-sol")
+        self.assertEqual(self.requests[0]["reasoning"], {"effort": "high"})
+        self.assertEqual(self.call("/api/settings")["model"], "gpt-6-luna")
+        self.assertEqual(self.call("/api/settings")["reasoning_effort"], "low")
+        count = len(self.requests)
+        second = self.uploaded(pdf_bytes("Default article model"))
+        self.assertEqual(self.settled(second)["status"], "completed")
+        self.assertEqual(self.requests[count]["model"], "gpt-6-luna")
+        self.assertEqual(self.requests[count]["reasoning"], {"effort": "low"})
+
+    def test_reference_title_lookup_is_separate_and_preserves_overview(self):
+        first = self.uploaded(pdf_bytes("Reference lookup"))
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        paper = self.call(path)
+        profile = paper["profile"]
+        original_summary = profile["content"]["summary"][:]
+        entry = profile["content"]["references"][2]
+        for key in ("title", "resolved_record", "publisher_url", "publication"):
+            entry.pop(key, None)
+        entry["dois"], entry["url"] = [], ""
+        store = self.server.store
+        with store.lock:
+            store.materials.publish(first["source"], store.materials.read(first["source"], "article.pdf"),
+                                    store.materials.read_text(first["source"]), profile)
+        count, downloads = len(self.requests), list(self.downloads)
+        repeated = self.settled(self.call(path + "/references", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(repeated["operation"], "references")
+        self.assertEqual(repeated["api_usage"]["calls"], 1)
+        self.assertEqual(self.requests[count]["text"]["format"]["name"], "reference_titles")
+        final = self.call(path)["profile"]
+        self.assertEqual(final["content"]["summary"], original_summary)
+        self.assertEqual(final["content"]["references"][2]["title"], "Power spectrum of light scattered by two-level systems")
+        self.assertEqual(final["content"]["references"][2]["url"], PUBLISHER)
+        self.assertEqual(self.downloads, downloads)
+
+    def test_title_resolution_survives_timeout_after_partial_progress(self):
+        def resolve(publications, http, references, on_update):
+            references[0]["title"] = "Confirmed title from metadata"
+            references[0]["url"] = "https://doi.org/10.1234/confirmed"
+            on_update()
+            raise StepExpired()
+
+        with patch("pipeline.resolve_reference_titles", side_effect=resolve):
+            job = self.uploaded(pdf_bytes("Partial references"), settings={"max_api_calls": 1})
+            result = self.settled(job)
+        self.assertEqual(result["status"], "completed")
+        final = self.call("/api/papers/" + job["paper_id"])["profile"]
+        self.assertEqual(final["content"]["references"][0]["title"], "Confirmed title from metadata")
+        self.assertEqual(final["steps"]["references"]["code"], "time_limit")
+
 
 class StorageTest(TempTest):
+    def test_legacy_numbered_references_repair_wraps_without_losing_metadata(self):
+        old = {"number": "1", "page": 1, "text": "A. Reader, Superconduc- tivity, Journal of Tests, 2020.",
+               "title": "Superconductivity", "arxiv_ids": [], "dois": ["10.1234/saved"],
+               "url": "https://doi.org/10.1234/saved", "citations": []}
+        _, _, paper_id, _ = self._save_old_profile(
+            ["Introduction\nSuperconductivity was observed [1].\nReferences\n[1] A. Reader, Superconduc-\ntivity, Journal of Tests, 2020."],
+            schema_version=3, references=[old])
+        store = Store(self.temp)
+        self.addCleanup(store.db.close)
+        recovered = store.paper(paper_id)["profile"]["content"]["references"][0]
+        self.assertIn("Superconductivity", recovered["text"])
+        self.assertNotIn("Superconduc-", recovered["text"])
+        self.assertEqual(recovered["title"], "Superconductivity")
+        self.assertEqual(recovered["url"], old["url"])
+
+    def test_bibliography_upgrade_keeps_previously_verified_answers(self):
+        library, source, paper_id, pdf = self._save_old_profile(["References\n[1] " + MOLLOW], schema_version=6)
+        profile = library.profile(source)
+        support = {"evidence": QUOTE, "page": 1, "section": "Результаты", "location": "Страница 1"}
+        profile["content"]["answers"] = [{"question": "Что измерено?", "answer": "4 дБ", "status": "answered", "sources": [support]},
+                                           {"question": "Старый ответ?", "answer": "Ответ", "status": "answered"}]
+        library.publish(source, pdf, library.read_text(source), profile)
+        store = Store(self.temp)
+        self.addCleanup(store.db.close)
+        answers = store.paper(paper_id)["profile"]["content"]["answers"]
+        self.assertEqual(answers[0]["status"], "answered")
+        self.assertEqual(answers[0]["sources"], [support])
+        self.assertEqual(answers[1]["status"], "unverified")
+
     def _save_old_profile(self, pages, *, schema_version, references=None):
         with closing(Store(self.temp).db) as db:
             store_source = "arxiv:" + FOCAL
@@ -756,7 +844,7 @@ class StorageTest(TempTest):
             self.assertIn("Библиография", upgraded["profile"]["coverage"]["sections"])
             self.assertEqual(upgraded["profile"]["coverage"]["notes"], [])
             self.assertEqual(store.jobs(), [])
-            self.assertIn("**Physical Review 188, 1969**  \n  B. R. Mollow  \n  (1969)",
+            self.assertIn("**Название не установлено**  \n  B. R. Mollow",
                           (library.folder(store_source) / "profile.md").read_text(encoding="utf-8"))
             self.assertEqual(library.read(store_source, "article.pdf"), pdf)
 

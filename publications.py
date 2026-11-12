@@ -195,12 +195,36 @@ def parse_arxiv_page(raw, base):
             "doi": doi(meta.first("citation_doi")), "url": arxiv_url(base, version), "source": "arXiv"}
 
 
+def metadata_title(value):
+    """Crossref titles can contain MathML/JATS; expose readable text, not XML tags."""
+    value = html.unescape(str(value or ""))
+    if not re.search(r"</?[A-Za-z]", value):
+        return compact(value, 500)
+    try:
+        root = ET.fromstring("<title>" + value + "</title>")
+    except ET.ParseError:
+        return compact(re.sub(r"<[^>]*>", "", value), 500)
+
+    def render(node):
+        name = node.tag.rsplit("}", 1)[-1].split(":")[-1]
+        if name in {"msup", "msub"} and len(node) == 2:
+            base, script = render(node[0]), render(node[1])
+            normal = "0123456789+-=()"
+            symbols = "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾" if name == "msup" else "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎"
+            return base + (script.translate(str.maketrans(normal, symbols)) if all(char in normal for char in script)
+                           else ("^{" if name == "msup" else "_{") + script + "}")
+        content = (node.text or "") + "".join(render(child) + (child.tail or "") for child in node)
+        return (" " if name == "math" else "") + content
+
+    return compact(render(root), 500)
+
+
 def crossref_record(record):
     if not isinstance(record, dict):
         return None
     identifier = doi(record.get("DOI"))
     titles = record.get("title") or []
-    title = compact(titles[0], 500) if isinstance(titles, list) else ""
+    title = metadata_title(titles[0]) if isinstance(titles, list) else ""
     if not identifier or not title:
         return None
     dates = (record.get("published") or {}).get("date-parts") or []
@@ -238,6 +262,17 @@ def _matches_citation(text, entry, work):
     year = work["published"][:4]
     if not (volume and page and year):
         return False
+    coordinates = re.search(rf" {re.escape(volume)}(?: \d{{1,3}})? {re.escape(page)} {re.escape(year)} ", text)
+    if coordinates:
+        before = text[:coordinates.start()].split()[-8:]
+        for key in ("container-title", "short-container-title"):
+            for name in entry.get(key) or []:
+                terms = [word for word in _citation_words(name).split() if word not in {"of", "the", "and"}]
+                for offset in range(len(before)):
+                    tail = [word for word in before[offset:] if word not in {"of", "the", "and"}]
+                    if terms and len(tail) >= len(terms) and all(
+                            left.startswith(right) or right.startswith(left) for left, right in zip(terms, tail)):
+                        return True
     for key in ("container-title", "short-container-title"):
         for name in entry.get(key) or []:
             journal = _citation_words(name)
@@ -313,10 +348,10 @@ class Publications:
             raise ServiceError("Crossref: неожиданный формат результатов поиска.")
         return message["items"]
 
-    def crossref_citation(self, http, citation):
+    def crossref_citation(self, http, citation, query=None):
         fields = "container-title,short-container-title,volume,issue,page,article-number,resource"
         text = " " + _citation_words(citation) + " "
-        matches = {work["doi"]: work for entry in self._crossref_items(http, compact(citation, 600), 3, fields)
+        matches = {work["doi"]: work for entry in self._crossref_items(http, compact(query or citation, 600), 3, fields)
                    if (work := crossref_record(entry)) and _matches_citation(text, entry, work)}
         return next(iter(matches.values())) if len(matches) == 1 else None
 
@@ -349,7 +384,9 @@ PROFILE_SCHEMA = object_schema(
     claims=array(object_schema(statement=STRING, kind=KIND, snippet=STRING, evidence=STRING, locator=STRING,
                                 check=STRING, explanation=STRING)),
     search_terms=array(STRING),
+    reference_hints=array(object_schema(reference_id=STRING, title=STRING, evidence=STRING, search_query=STRING)),
 )
+REFERENCE_SCHEMA = object_schema(reference_hints=PROFILE_SCHEMA["properties"]["reference_hints"])
 ANALOG_SCHEMA = object_schema(
     analogs=array(object_schema(candidate_id=STRING, similarity=STRING, difference=STRING,
                                  snippet=STRING)),

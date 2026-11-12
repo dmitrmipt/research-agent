@@ -10,9 +10,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from manuscripts import select_manuscript
-from materials import EXTRACTION_VERSION, MaterialError, document_text, extract_pdf, extraction_signature, split_sections
-from publications import Http, Model, ServiceError
+from materials import EXTRACTION_VERSION, MaterialError, _reference_item, document_text, extract_pdf, extraction_signature, split_sections
+from publications import Http, Model, REFERENCE_SCHEMA, ServiceError
 from research import (ANALOGS_SKIPPED, LEGACY_SEARCH_NOTES, _bibliography_records, _enrich_references,
+                      REFERENCE_INSTRUCTIONS, apply_reference_hints, reference_inputs, resolve_reference_titles,
                       _ranked_references, prepare_profile, search_analogs)
 
 STEP_NAMES = {"material": "Получение и извлечение текста", "core": "Основной профиль",
@@ -109,7 +110,7 @@ class Pipeline:
         profile.update(job_id=self.job_id, revision=uuid.uuid4().hex, steps=self.store.job(self.job_id)["steps"])
         if self.new_core:
             profile["usage"] = self.usage()
-        elif self.job["operation"] == "analogs" or self.job["parent_job_id"]:
+        elif self.job["operation"] in ("analogs", "references") or self.job["parent_job_id"]:
             profile["continuation_usage"] = self.usage()
         with self.store.lock:
             self.alive()
@@ -127,7 +128,7 @@ class Pipeline:
         if self.job["parent_job_id"] and durable.get(key, {}).get("status") in ("completed", "not_applicable"):
             self.step(key, durable[key]["status"], durable[key].get("message", ""))
             return
-        if self.job["operation"] == "analogs" and key != "analogs":
+        if self.job["operation"] in ("analogs", "references") and key != self.job["operation"]:
             self.step(key, "not_applicable")
             return
         before = copy.deepcopy(self.profile)
@@ -138,10 +139,12 @@ class Pipeline:
             message = action()
             self.optional_checkpoint()
         except StepExpired:
-            self.profile = before
+            if key != "references":
+                self.profile = before
             self.step(key, "skipped", "Недостаточно времени. Результат предыдущих этапов сохранён.", "time_limit")
         except (ServiceError, MaterialError) as error:
-            self.profile = before
+            if key != "references":
+                self.profile = before
             self.step(key, "failed", str(error), "service_error")
         else:
             if message is not False:
@@ -152,6 +155,18 @@ class Pipeline:
         content, article = self.profile["content"], self.profile["article"]
         sources = []
         parts = split_sections(self.document["pages"])
+        inputs = reference_inputs(content["references"], parts)
+        if self.job["operation"] == "references" and inputs:
+            model = Model(self.optional_http, self.worker.api_key, self.job["settings"], self.model.start_call, self.model.record_usage)
+            try:
+                result = model.ask("reference_titles", REFERENCE_SCHEMA, REFERENCE_INSTRUCTIONS, {"references": inputs})
+                apply_reference_hints(content["references"], inputs, result["reference_hints"])
+            except ServiceError as error:
+                self.profile["reference_search_note"] = "Уточнение моделью не завершено: " + str(error)
+            self.publish()
+        failures = resolve_reference_titles(self.worker.publications, self.optional_http, content["references"], self.publish)
+        if failures:
+            raise ServiceError("; ".join(dict.fromkeys(failures)))
         records = _bibliography_records(self.worker.publications, self.optional_http,
                                        _ranked_references(content["references"], parts, self.profile["search_terms"]),
                                        sources, article["doi"])
@@ -159,6 +174,10 @@ class Pipeline:
         failures = [source["message"] for source in sources if source["status"] != "ok"]
         if failures:
             raise ServiceError("; ".join(failures))
+        missing = sum(_reference_item(entry)["missing_title"] for entry in content["references"])
+        if missing:
+            self.step("references", "failed", f"Для {missing} записей название пока не установлено. Можно повторить уточнение.", "missing_titles")
+            return False
 
     def analogs(self):
         if self.job["settings"]["max_api_calls"] <= self.usage()["calls"]:
@@ -214,8 +233,8 @@ class Pipeline:
                            and current["job_id"] == job["parent_job_id"]
                            and current.get("steps", {}).get("core", {}).get("status") == "completed"
                            and (not cached or cached["article"].get("sha256") == current["article"].get("sha256")))
-        if job["operation"] == "analogs" or resume_core:
-            if not current or not current["content"]["summary"]:
+        if job["operation"] in ("analogs", "references") or resume_core:
+            if not current or (not current["content"]["summary"] and job["operation"] != "references"):
                 raise MaterialError("Сохранённый профиль с обзором недоступен.")
             self.profile = copy.deepcopy(current)
             if job["parent_job_id"]:
@@ -225,7 +244,7 @@ class Pipeline:
             self.raw = cached["pdf"]
             self.document = cached["document"] or extract_pdf(self.raw, self.checkpoint)
             self.save_material(self.raw, self.profile["article"], self.document)
-            self.step("core", "completed")
+            self.step("core", "completed" if current["content"]["summary"] else "not_applicable")
         else:
             if not cached and job["operation"] == "reanalyze":
                 if not current:

@@ -23,7 +23,7 @@ from urllib.parse import parse_qs, urlparse
 from manuscripts import render_tex_preview
 from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, MaterialError, MaterialLibrary, abstract_from_parts, arxiv_id,
                        clean_text, extraction_signature, profile_sections, render_markdown_preview, saved_pages, split_sections)
-from publications import Http, Publications, ServiceError
+from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
                       reference_url)
 from version import VERSION
@@ -156,13 +156,12 @@ class Store:
                 parts = split_sections(saved_pages(text))
                 content = profile["content"]
                 entries = content.get("references") or []
-                if profile["schema_version"] < 4 and parts:
-                    if entries and all(entry["number"] for entry in entries):
-                        locate_citations(entries, parts)
-                    else:
-                        entries = bibliography(parts, entries) or entries
+                if profile["schema_version"] < 7 and parts:
+                    entries = bibliography(parts, entries) or entries
                 for entry in entries:
                     entry["url"] = reference_url(entry)
+                    if entry.get("title"):
+                        entry["title"] = metadata_title(entry["title"])
                 content["references"] = entries
                 if profile["schema_version"] < 5 and content["summary"]:
                     content["summary"] = [" ".join(content["summary"])]
@@ -170,7 +169,7 @@ class Store:
                 profile.setdefault("result_status", "ready" if content["summary"] else "partial")
                 for answer in content.get("answers", []):
                     answer.setdefault("sources", [])
-                    if answer["status"] == "answered":
+                    if answer["status"] == "answered" and not answer.get("sources"):
                         answer["status"] = "unverified"
                 article = profile["article"]
                 if not article.get("abstract"):
@@ -231,6 +230,7 @@ class Store:
         depth = data.get("depth", "standard")
         scenario = data.get("scenario", "success")
         questions = data.get("questions", "")
+        job_settings = self.validate_settings(data.get("settings", {}))
         if mode not in ("demo", "research") or depth not in ("brief", "standard", "deep") or scenario not in ("success", "error"):
             raise ValueError("Неизвестная глубина или сценарий.")
         if not isinstance(questions, str) or len(questions) > 12000:
@@ -261,7 +261,8 @@ class Store:
             self.db.execute("INSERT OR IGNORE INTO papers VALUES (?, ?, ?, ?, ?)",
                             (uuid.uuid4().hex, source, title, kind, now()))
             paper_id = self.db.execute("SELECT id FROM papers WHERE source=?", (source,)).fetchone()[0]
-            job_id = self._enqueue(paper_id, mode, depth, questions, "refresh" if refresh else scenario, input_source)
+            job_id = self._enqueue(paper_id, mode, depth, questions, "refresh" if refresh else scenario, input_source,
+                                   settings=job_settings)
             if raw is not None:
                 upload = self.directory / "uploads" / (digest + ".pdf")
                 pending = upload.with_suffix("." + job_id + ".tmp")
@@ -355,10 +356,10 @@ class Store:
     def retry_info(self, job):
         pending = [key for key, value in job["steps"].items()
                    if value["status"] not in ("completed", "not_applicable")
-                   and (job["operation"] != "analogs" or key in ("material", "analogs"))]
+                   and (job["operation"] not in ("analogs", "references") or key in ("material", job["operation"]))]
         blocked = any(value.get("code") == "no_text" for value in job["steps"].values())
         allowed = job["mode"] == "research" and job["status"] not in ACTIVE and bool(pending) and not blocked
-        model_needed = "core" in pending or "analogs" in pending
+        model_needed = "core" in pending or "analogs" in pending or job["operation"] == "references" and "references" in pending
         return {"allowed": allowed, "steps": [STEP_NAMES[key] for key in pending], "model_needed": model_needed,
                 "message": "Нужен PDF с текстовым слоем. Загрузите подходящий файл." if blocked else
                 "Выполним только недостающие этапы. Вызовы модели учитываются в новом задании." if pending else
@@ -442,6 +443,17 @@ class Store:
             if not profile or not profile["content"]["summary"]:
                 raise ValueError("Сначала подготовьте профиль статьи с обзором.")
             job_id = self._enqueue(paper_id, "research", "standard", profile["questions"], "analogs", paper["source"])
+            return self.job(job_id)
+
+    def repeat_references(self, paper_id):
+        with self.lock, self.db:
+            paper = self.db.execute("SELECT source FROM papers WHERE id=?", (paper_id,)).fetchone()
+            if not paper:
+                return None
+            profile = self.materials.profile(paper["source"])
+            if not profile or not profile["content"].get("references"):
+                raise ValueError("Сначала получите статью со списком литературы.")
+            job_id = self._enqueue(paper_id, "research", "standard", profile["questions"], "success", paper["source"], operation="references")
             return self.job(job_id)
 
     def job(self, job_id):
@@ -802,10 +814,11 @@ class Handler(BaseHTTPRequestHandler):
                     return remaining
                 self.server.worker.catalog.refresh(Http(catalog_checkpoint))
                 return self.respond(200, self.server.worker.catalog.snapshot())
-            match = re.fullmatch(r"/api/papers/([a-f0-9]{32})/(refresh|analogs|reanalyze)", path)
+            match = re.fullmatch(r"/api/papers/([a-f0-9]{32})/(refresh|analogs|reanalyze|references)", path)
             if match:
                 job = (self.store.refresh(match[1]) if match[2] == "refresh" else
-                       self.store.reanalyze(match[1], data) if match[2] == "reanalyze" else self.store.repeat_analogs(match[1]))
+                       self.store.reanalyze(match[1], data) if match[2] == "reanalyze" else
+                       self.store.repeat_references(match[1]) if match[2] == "references" else self.store.repeat_analogs(match[1]))
                 if job:
                     return self.respond(201, job)
                 return self.respond(404, {"error": "Статья не найдена."})
