@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from manuscripts import render_tex_preview
 from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, RMP_REFERENCE_START, MaterialError, MaterialLibrary,
-                       abstract_from_parts, arxiv_id, citation_location, clean_text, extraction_signature, profile_sections,
+                       abstract_from_parts, arxiv_id, citation_location, clean_text, extraction_signature, main_text_pages, profile_sections,
                        render_markdown_preview, saved_pages, split_sections)
 from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
@@ -157,14 +157,17 @@ class Store:
                 if not profile or profile["schema_version"] >= PROFILE_VERSION:
                     continue
                 text = self.materials.read_text(source)
-                parts = split_sections(saved_pages(text))
+                pages = saved_pages(text)
+                main_pages, _ = main_text_pages(pages)
+                parts = split_sections(main_pages)
                 content = profile["content"]
+                content["analogs"] = [analog for analog in content.get("analogs", []) if analog.get("page")]
                 entries = content.get("references") or []
                 if parts and (profile["schema_version"] < 9 or not entries or any(
                         not entry["number"] and RMP_REFERENCE_START.match(entry["text"]) for entry in entries)):
                     entries = bibliography(parts, entries) or entries
                 if parts:
-                    locate_citations(entries, parts)
+                    locate_citations(entries, split_sections(pages), max_page=len(main_pages))
                 for entry in entries:
                     entry["url"] = reference_url(entry)
                     if entry.get("title"):
@@ -211,8 +214,8 @@ class Store:
             if not isinstance(value, str) or len(value) > 12000:
                 raise ValueError("Некорректное поле настроек: " + key)
             result[key] = clean_text(value)
-        for key, low, high in (("stage_seconds", 1, 10), ("time_limit_seconds", 5, 600),
-                               ("max_api_calls", 1, 2), ("max_output_tokens", 1000, 12000)):
+        for key, low, high in (("stage_seconds", 1, 10), ("time_limit_seconds", 5, 3600),
+                               ("max_api_calls", 1, 6), ("max_output_tokens", 1000, 12000)):
             value = data.get(key, current[key])
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"{key}: допустимо целое число от {low} до {high}.")
@@ -224,6 +227,11 @@ class Store:
         # Changing a model never carries an incompatible effort over silently.
         effort = data.get("reasoning_effort", current.get("reasoning_effort", "auto") if model == current["model"] else "auto")
         result["reasoning_effort"] = validate_effort(model, effort)
+        review = data.get("review_bibliography", current.get("review_bibliography", False))
+        if type(review) is not bool:
+            raise ValueError("Некорректный параметр проверки библиографии.")
+        if review:
+            result["review_bibliography"] = True
         return result
 
     def save_settings(self, data):
@@ -251,8 +259,10 @@ class Store:
                 raw = base64.b64decode(pdf.get("data", ""), validate=True)
             except (ValueError, TypeError):
                 raise ValueError("Некорректные данные PDF.") from None
-            if not raw.startswith(b"%PDF-") or len(raw) > PDF_LIMIT:
-                raise ValueError("Нужен PDF размером до 15 МБ.")
+            if not raw.startswith(b"%PDF-"):
+                raise ValueError("Нужен файл PDF.")
+            if depth != "vision" and len(raw) > PDF_LIMIT:
+                raise ValueError("Для PDF больше 15 МБ выберите «Полный текст + картинки».")
             digest = hashlib.sha256(raw).hexdigest()
             source, kind = "upload:" + digest, "pdf"
             name = pdf.get("name", "document.pdf")
@@ -292,6 +302,11 @@ class Store:
             current_profile = self.materials.profile(source)
             if current_profile:
                 input_revision = current_profile.get("revision", current_profile["job_id"])
+        settings = dict(settings or self.settings())
+        if mode == "research" and depth == "vision":
+            settings.update(max_api_calls=6, time_limit_seconds=max(600, settings["time_limit_seconds"]))
+        elif mode == "research" and settings.get("review_bibliography") and not parent_job_id:
+            settings["max_api_calls"] = min(6, settings["max_api_calls"] + 1)
         job_id, timestamp = uuid.uuid4().hex, now()
         if scenario == "analogs":
             message = "Задание на повторный поиск аналогов сохранено."
@@ -302,7 +317,7 @@ class Store:
             (id,paper_id,created,updated,status,stage,questions,depth,scenario,settings,events,mode,input_source)
             VALUES (?, ?, ?, ?, 'queued', 'В очереди', ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, paper_id, timestamp, timestamp, clean_text(questions), depth, scenario,
-             json.dumps({**(settings or self.settings()), "pricing": model_info((settings or self.settings())["model"])["pricing"]}, ensure_ascii=False),
+             json.dumps({**settings, "pricing": model_info(settings["model"])["pricing"]}, ensure_ascii=False),
              json.dumps([{"time": timestamp, "message": message}], ensure_ascii=False), mode, input_source))
         self.db.execute("""UPDATE jobs SET operation=?,parent_job_id=?,input_revision=?,source_sha256=? WHERE id=?""",
                         (operation or (scenario if scenario in ("refresh", "analogs") else "profile"),
@@ -366,7 +381,8 @@ class Store:
                    and (job["operation"] not in ("analogs", "references") or key in ("material", job["operation"]))]
         blocked = any(value.get("code") == "no_text" for value in job["steps"].values())
         allowed = job["mode"] == "research" and job["status"] not in ACTIVE and bool(pending) and not blocked
-        model_needed = "core" in pending or "analogs" in pending or job["operation"] == "references" and "references" in pending
+        model_needed = ("core" in pending or "analogs" in pending or "references" in pending
+                        and (job["operation"] == "references" or job["settings"].get("review_bibliography")))
         return {"allowed": allowed, "steps": [STEP_NAMES[key] for key in pending], "model_needed": model_needed,
                 "message": "Нужен PDF с текстовым слоем. Загрузите подходящий файл." if blocked else
                 "Выполним только недостающие этапы. Вызовы модели учитываются в новом задании." if pending else
@@ -411,9 +427,24 @@ class Store:
             return None
         if meta["source"] != source or meta["sha256"] != hashlib.sha256(raw).hexdigest():
             raise MaterialError("Сохранённые материалы задания изменились.")
+        current_parser = meta.get("version") == EXTRACTION_VERSION and meta.get("parser") == extraction_signature()
+        visual = None
+        if current_parser:
+            try:
+                visual = json.loads(MaterialLibrary._direct(folder / "visual.json").read_text(encoding="utf-8"))
+            except (FileNotFoundError, ValueError):
+                pass
         return {"pdf": raw, "article": meta["article"],
-                "document": meta.get("document") if meta.get("version") == EXTRACTION_VERSION
-                and meta.get("parser") == extraction_signature() else None}
+                "document": meta.get("document") if current_parser else None, "visual": visual}
+
+    def save_visual_checkpoint(self, job_id, state):
+        with self.lock:
+            if not self.active(job_id):
+                raise JobStopped()
+            folder = MaterialLibrary._direct(self.directory.resolve() / "checkpoints" / job_id)
+            pending = MaterialLibrary._direct(folder / "visual.json.tmp")
+            pending.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            MaterialLibrary._move_with_retry(pending, MaterialLibrary._direct(folder / "visual.json"), replace=True)
 
     def discard_checkpoint(self, job_id):
         """Remove only our temporary files after all stages have been saved."""
@@ -423,7 +454,7 @@ class Store:
         if not folder.exists():
             return
         try:
-            for name in ("article.pdf", "checkpoint.json", "article.pdf.tmp", "checkpoint.json.tmp"):
+            for name in ("article.pdf", "checkpoint.json", "visual.json", "article.pdf.tmp", "checkpoint.json.tmp", "visual.json.tmp"):
                 MaterialLibrary._direct(folder / name).unlink(missing_ok=True)
             folder.rmdir()
         except OSError:
@@ -481,6 +512,19 @@ class Store:
         with self.lock:
             return [dict(r) for r in self.db.execute("""SELECT j.id,j.paper_id,j.created,j.updated,j.status,j.stage,j.progress,j.mode,j.result_status,p.title
                 FROM jobs j JOIN papers p ON j.paper_id=p.id ORDER BY j.created DESC""")]
+
+    def delete_job(self, job_id):
+        with self.lock, self.db:
+            job = self.db.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                return False
+            if job["status"] in ACTIVE or self.db.execute(
+                "SELECT 1 FROM jobs WHERE parent_job_id=? AND status IN ('queued','running')", (job_id,)
+            ).fetchone():
+                raise ValueError("Дождитесь окончания задания или его продолжения.")
+            self.db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        self.discard_checkpoint(job_id)
+        return True
 
     def active(self, job_id):
         with self.lock:
@@ -556,6 +600,8 @@ class Store:
     def record_api(self, job_id, *, attempt_model=None, usage=None):
         with self.lock, self.db:
             job = self.job(job_id)
+            if job is None:
+                raise JobStopped()
             record = job["api_usage"]
             if attempt_model is not None:
                 if job["status"] not in ACTIVE:
@@ -627,6 +673,8 @@ class Worker:
 
     def fail(self, job_id, message):
         job = self.store.job(job_id)
+        if job is None or job["status"] not in ACTIVE:
+            return
         for key, value in job["steps"].items():
             if value["status"] == "running":
                 self.store.step(job_id, key, "failed", message, "processing_error")
@@ -827,13 +875,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";")[0] != "application/json":
             return self.respond(415, {"error": "Ожидается JSON."})
         try:
+            path = urlparse(self.path).path
             size = int(self.headers.get("Content-Length", "0"))
-            if not 0 < size <= 22 * 1024 * 1024:
+            if size <= 0 or (path != "/api/jobs" and size > 22 * 1024 * 1024):
                 return self.respond(413, {"error": "Размер запроса превышен или запрос пуст."})
             data = json.loads(self.rfile.read(size))
             if not isinstance(data, dict):
                 raise ValueError("Ожидается объект JSON.")
-            path = urlparse(self.path).path
             if path == "/api/settings":
                 return self.respond(200, self.store.save_settings(data))
             if path == "/api/jobs":
@@ -855,6 +903,11 @@ class Handler(BaseHTTPRequestHandler):
                 if job:
                     return self.respond(201, job)
                 return self.respond(404, {"error": "Статья не найдена."})
+            match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/delete", path)
+            if match:
+                if self.store.delete_job(match[1]):
+                    return self.respond(200, {"deleted": True})
+                return self.respond(404, {"error": "Задание не найдено."})
             match = re.fullmatch(r"/api/jobs/([a-f0-9]{32})/cancel", path)
             if match:
                 if not self.store.job(match[1]):

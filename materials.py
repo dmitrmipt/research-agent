@@ -10,7 +10,6 @@ import subprocess
 import sys
 import time
 import unicodedata
-from html import escape
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
@@ -18,20 +17,21 @@ from urllib.parse import quote, urlencode, urlsplit
 from manuscripts import SOURCE_FILES
 from bibliographic import reference_text
 from math_markup import MATH_HEADER, escape_markdown, markdown_math
+from pdf_text import pdfium_document, restore_word_spaces
 from version import VERSION
 
 PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
 MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
-PROFILE_VERSION = 9
-EXTRACTION_VERSION = 1
+PROFILE_VERSION = 10
+EXTRACTION_VERSION = 2
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
 PAREN_REFERENCE = re.compile(r"^[ \t]*(\d{1,4})\)[ \t]+(?=\S)", re.M)
 NUMBERED_REFERENCE = re.compile(r"^[ \t]*(?:\[(\d{1,4})\]|(\d{1,4})[.)])[ \t]+(?=\S)", re.M)
 REFERENCE_SIGNAL = re.compile(r"\b(?:18|19|20)\d{2}\b|arxiv\s*:|10\.\d{4,9}/", re.I)
-SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) materials?|дополнительные материалы)(?: for\b.*)?$")
+SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) (?:materials?|information|appendix|data)|дополнительные материалы)(?: for\b.*)?$")
 LETTERED_APPENDIX_HEADING = re.compile(r"^A\s+[A-Z][^\s,.;]*\s+[^,.;]{1,140}$")
 BIBLIOGRAPHIC_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
 AUTHOR_YEAR_START = re.compile(rf"^[^\W\d_][^,\d]{{0,59}},\s+(?:[^\W\d_]\.\s*)+[^()]{{0,220}}\({BIBLIOGRAPHIC_YEAR}\)\.")
@@ -81,10 +81,14 @@ SECTION_NAMES = {
 
 
 def extraction_signature():
-    try:
-        return f"{EXTRACTION_VERSION}/pypdf/{package_version('pypdf')}"
-    except PackageNotFoundError:
-        return f"{EXTRACTION_VERSION}/pypdf/unavailable"
+    signature = [str(EXTRACTION_VERSION)]
+    for package in ("pypdf", "pypdfium2"):
+        try:
+            installed = package_version(package)
+        except PackageNotFoundError:
+            installed = "unavailable"
+        signature.extend((package, installed))
+    return "/".join(signature)
 
 
 class MaterialError(RuntimeError):
@@ -132,7 +136,7 @@ def web_link(value):
     return ""
 
 
-def _pdf_data(raw):
+def _pdf_data(raw, *, full=False):
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(raw), strict=False)
@@ -149,43 +153,49 @@ def _pdf_data(raw):
     pages, links, notes = [], [], []
     remaining = TEXT_LIMIT
     clipped = False
-    for index in range(min(page_count, PAGE_LIMIT)):
-        page = reader.pages[index]
-        try:
-            text = clean_text(page.extract_text())
-        except Exception:
-            text = ""
-        size = min(remaining, 60_000)
-        clipped |= len(text) > size
-        pages.append(text[:size])
-        remaining -= len(pages[-1])
-        try:
-            for annotation in list(page.get("/Annots") or [])[:200]:
-                action = annotation.get_object().get("/A")
-                url = web_link(action.get_object().get("/URI")) if action else ""
-                if url and len(links) < 250:
-                    links.append({"url": url, "page": index + 1})
-        except (ValueError, TypeError, AttributeError, KeyError):
-            pass
-        if remaining <= 0:
-            break
+    with pdfium_document(raw) as spacing_pdf:
+        for index in range(page_count if full else min(page_count, PAGE_LIMIT)):
+            page = reader.pages[index]
+            try:
+                text = clean_text(page.extract_text())
+            except Exception:
+                text = ""
+            size = len(text) if full else min(remaining, 60_000)
+            clipped |= len(text) > size
+            text = restore_word_spaces(spacing_pdf, index, text[:size])
+            if full:
+                size = len(text)
+            clipped |= len(text) > size
+            pages.append(text[:size])
+            remaining -= len(pages[-1])
+            try:
+                for annotation in list(page.get("/Annots") or [])[:200]:
+                    action = annotation.get_object().get("/A")
+                    url = web_link(action.get_object().get("/URI")) if action else ""
+                    if url and len(links) < 250:
+                        links.append({"url": url, "page": index + 1})
+            except (ValueError, TypeError, AttributeError, KeyError):
+                pass
+            if not full and remaining <= 0:
+                break
     missing = sum(not page for page in pages)
     if missing:
         notes.append(f"На {missing} из {len(pages)} просмотренных страниц текст извлечь не удалось.")
     if len(pages) < page_count or clipped:
         notes.append(f"Извлечение ограничено объёмом. Просмотрено страниц: {len(pages)} из {page_count}.")
     return {"metadata": fields, "pages": pages, "page_count": page_count,
-            "partial": bool(missing or len(pages) < page_count or clipped), "notes": notes, "links": links}
+            "partial": bool(missing or len(pages) < page_count or clipped), "notes": notes, "links": links,
+            "full_extraction": full}
 
 
-def extract_pdf(raw, checkpoint):
+def extract_pdf(raw, checkpoint, *, full=False):
     """Run parsing in a child process so cancellation and the deadline can stop it."""
     checkpoint()
-    if not raw.startswith(b"%PDF-") or len(raw) > PDF_LIMIT:
+    if not raw.startswith(b"%PDF-") or not full and len(raw) > PDF_LIMIT:
         raise MaterialError("Источник не вернул PDF размером до 15 МБ.")
     env = {key: value for key, value in os.environ.items() if key.upper() != "OPENAI_API_KEY"}
     process = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "extract"], stdin=subprocess.PIPE,
+        [sys.executable, str(Path(__file__).resolve()), "extract-full" if full else "extract"], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
@@ -304,6 +314,18 @@ def split_sections(pages):
                 part["separate_supplement"] = True
             parts.append(part)
     return parts
+
+
+def main_text_pages(pages):
+    """Keep the main manuscript, including its references and inline appendices."""
+    for index, text in enumerate(pages):
+        for match in re.finditer(r"^.*$", text, re.M):
+            if SUPPLEMENT_HEADING.fullmatch(match[0].strip().casefold().rstrip(":")):
+                prefix = text[:match.start()].strip()
+                if prefix and not prefix.isdecimal():
+                    return [*pages[:index], prefix], match[0].strip()
+                return pages[:index], ""
+    return pages, ""
 
 
 def abstract_from_parts(parts):
@@ -646,7 +668,11 @@ def _reference_item(entry):
 
 def _analog_pdf_page(analog):
     page = analog.get("page")
-    if not page or analog["source"] != "arXiv":
+    if not page:
+        return ""
+    if url := web_link(analog.get("pdf_url")):
+        return url.split("#", 1)[0] + f"#page={page}"
+    if analog["source"] != "arXiv":
         return ""
     try:
         identifier, version = arxiv_id(analog["url"])
@@ -685,7 +711,8 @@ def profile_sections(profile):
         coverage_details.append(item("Уточнение названий", profile["reference_search_note"]))
     if selection:
         budget = selection["budget_chars"]
-        scope = f'Лимит — {budget} символов.' if budget is not None else "Выбран полный текст."
+        scope = ("Выбран полный текст с иллюстрациями." if profile.get("analysis", {}).get("depth") == "vision"
+                 else f'Лимит — {budget} символов.' if budget is not None else "Выбран полный текст.")
         label = "Передано модели" if usage["calls"] else "Подготовлено для модели"
         coverage_items.append(item(label, f'{selection["selected_fragments"]} из {selection["available_fragments"]} фрагментов · '
                                    f'{selection["selected_chars"]} из {selection["available_chars"]} символов. {scope}'))
@@ -732,27 +759,33 @@ def profile_sections(profile):
                      item("Основа сравнения", analog["basis"]),
                      {**item("Подтверждающий фрагмент", f'«{analog["evidence"]}»', _analog_pdf_page(analog)),
                       "location": analog["location"]}]}
-        for analog in content["analogs"]
+        for analog in content["analogs"] if analog.get("page")
     ]
     keywords = [item(word["term"], f'{word["weight"]}% · {word["role"]}') for word in content["keywords"]]
     if article["author_keywords"]:
         keywords.append(item("Ключевые слова авторов", ", ".join(article["author_keywords"])))
-    if content["topics"]:
-        keywords.append(item("Темы", ", ".join(content["topics"])))
+    topics = content["topics"]
+    illustrations = [
+        {**item(f'Рисунок {record["number"]}'), "byline": f'Страница {record["page"]} PDF',
+         "details": [{**item("Что показано", record["description"]),
+                      "location": f'Страница {record["page"]} PDF', "page": record["page"]},
+                     item("Связь с текстом", record["connection"]), item("Результат", record["result"])]}
+        for record in content.get("illustrations", [])
+    ]
     resources = [item(resource["kind"], f'Страница {resource["page"]} · {resource["url"]}', resource["url"])
                  for resource in content["resources"]]
     references = [_reference_item(entry) for entry in content.get("references", [])]
     search = profile.get("analog_search")
     search_notes, search_items = [], []
     if search:
-        search_notes.append(f'Найдено уникальных работ: {search["records"]}. Доступен текст или аннотация: '
-                            f'{search["candidates"]}, из них с фрагментами PDF: {search["full_text"]}.')
+        search_notes.append(f'Найдено уникальных работ: {search["records"]}. Для сравнения прочитан основной текст PDF: '
+                            f'{search["full_text"]}.')
         if search["proposed"] is not None:
             search_notes.append(f'Модель предложила {search["proposed"]}, сохранено {search["accepted"]}.')
         elif search["model_error"]:
             search_notes.append(f'Сравнение не завершено. {search["model_error"]}')
         else:
-            search_notes.append("Для сравнения требуются кандидаты с доступным текстом или аннотацией.")
+            search_notes.append("Для сравнения требуется доступный полный текст кандидата.")
         if search["preserved"]:
             search_notes.append("Показаны аналоги из предыдущего поиска.")
         if "usage" in search:
@@ -775,8 +808,12 @@ def profile_sections(profile):
          "subsections": [{"key": "coverage-details", "title": "Подробности чтения", "items": coverage_details}]},
         {"key": "overview", "title": "Краткий обзор", "paragraphs": summary or ["Обзор недоступен."],
          "items": [], "subsections": subsections, "math": "display"},
-        {"key": "keywords", "title": "Ключевые слова и темы", "paragraphs": [] if keywords else ["Не выделены."], "items": keywords, "math": "inline"},
+        {"key": "keywords", "title": "Ключевые слова и темы", "paragraphs": [] if keywords or topics else ["Не выделены."],
+         "items": keywords, "topics": topics, "math": "inline"},
         {"key": "claims", "title": "Основные утверждения", "paragraphs": [] if claims else ["Утверждения с подтверждающими фрагментами не выделены."], "items": claims, "math": "display"},
+        *([{"key": "illustrations", "title": "Анализ иллюстраций", "items": illustrations, "math": "display",
+            "paragraphs": [] if illustrations else ["В основном тексте рисунки не выделены."]}]
+          if "illustrations" in content else []),
         {"key": "references", "title": "Список литературы", "paragraphs": [] if references else ["Записи не выделены из доступного текста."], "items": references},
         {"key": "analogs", "title": "Ближайшие аналоги", "paragraphs": [] if analogs else ["Достаточно обоснованных аналогов не найдено."], "items": analogs, "math": "display"},
         *([{"key": "search", "title": "Как искали аналоги", "paragraphs": search_notes, "items": search_items}] if search else []),
@@ -838,6 +875,8 @@ def render_markdown(profile):
             lines.extend([_markdown_text(paragraph, section.get("math")), ""])
         for item in section["items"]:
             lines.extend(_markdown_item(section["key"], item, section.get("math")))
+        if section.get("topics"):
+            lines.extend(["", "### Темы", "", *["- " + _markdown_text(topic, "inline") for topic in section["topics"]]])
         if steps := section.get("steps"):
             labels = {"material": "Материалы", "core": "Основной профиль", "references": "Библиография",
                       "analogs": "Аналоги", "manuscript": "Исходник"}
@@ -863,7 +902,11 @@ def render_markdown_preview(data, snapshot):
     try:
         from markdown_it import MarkdownIt
     except ImportError:
-        content = f"<pre>{escape(source)}</pre>"
+        query = f"?snapshot={quote(snapshot, safe='')}" if snapshot else ""
+        content = ("<h1>Форматированный просмотр недоступен</h1>"
+                   "<p>Установите зависимости в окружение сервера командой "
+                   "<code>python -m pip install -r requirements.txt</code> и перезапустите Research Agent.</p>"
+                   f'<p><a href="profile.md{query}">Скачать профиль .md</a></p>')
     else:
         parser = MarkdownIt("js-default", {"breaks": True})
         parser.use(markdown_math, legacy=legacy)
@@ -912,9 +955,10 @@ def citation_location(data, anchor):
     return part["page"], part["text"], start, end
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["extract"]:
+if __name__ == "__main__" and sys.argv[1:] in (["extract"], ["extract-full"]):
     try:
-        result = _pdf_data(sys.stdin.buffer.read(PDF_LIMIT + 1))
+        full = sys.argv[1] == "extract-full"
+        result = _pdf_data(sys.stdin.buffer.read(-1 if full else PDF_LIMIT + 1), full=full)
     except ImportError:
         result = {"error": "Для извлечения текста установите pypdf: python -m pip install -r requirements.txt."}
     except Exception:

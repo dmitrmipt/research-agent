@@ -10,11 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from manuscripts import select_manuscript
-from materials import EXTRACTION_VERSION, MaterialError, _reference_item, document_text, extract_pdf, extraction_signature, split_sections
-from publications import Http, Model, REFERENCE_SCHEMA, ServiceError
-from research import (ANALOGS_SKIPPED, LEGACY_SEARCH_NOTES, _bibliography_records, _enrich_references,
-                      REFERENCE_INSTRUCTIONS, apply_reference_hints, locate_citations, reference_inputs, resolve_reference_titles,
-                      _ranked_references, prepare_profile, search_analogs)
+from materials import (EXTRACTION_VERSION, MaterialError, _reference_item, document_text, extract_pdf,
+                       extraction_signature, main_text_pages, split_sections)
+from publications import Http, Model, REFERENCE_REVIEW_SCHEMA, REFERENCE_SCHEMA, ServiceError
+from research import (LEGACY_SEARCH_NOTES, REFERENCE_INSTRUCTIONS, _bibliography_records,
+                      _enrich_references, _ranked_references, apply_reference_hints, bibliography, locate_citations,
+                      prepare_profile, reference_inputs, resolve_reference_titles, search_analogs)
 
 STEP_NAMES = {"material": "Получение и извлечение текста", "core": "Основной профиль",
               "references": "Уточнение библиографии", "analogs": "Поиск аналогов", "manuscript": "Исходник рукописи"}
@@ -109,8 +110,15 @@ class Pipeline:
         self.raw = cached["pdf"]
         document = cached["document"]
         if document is None:
-            document = extract_pdf(self.raw, self.checkpoint)
-            locate_citations(self.profile["content"].get("references", []), split_sections(document["pages"]))
+            full = current.get("analysis", {}).get("depth") == "vision"
+            document = extract_pdf(self.raw, self.checkpoint, full=True) if full else extract_pdf(self.raw, self.checkpoint)
+            pages, _ = main_text_pages(document["pages"])
+            parts = split_sections(pages)
+            content = self.profile["content"]
+            previous = content.get("references", [])
+            entries = bibliography(parts, previous)
+            locate_citations(entries or previous, split_sections(document["pages"]), max_page=len(pages))
+            content["references"] = entries or previous
         self.save_material(self.raw, self.profile["article"], document)
 
     def publish(self, manuscript=None):
@@ -164,17 +172,35 @@ class Pipeline:
     def references(self):
         content, article = self.profile["content"], self.profile["article"]
         sources = []
-        parts = split_sections(self.document["pages"])
-        inputs = reference_inputs(content["references"], parts)
-        if self.job["operation"] == "references" and inputs:
+        parts = split_sections(main_text_pages(self.document["pages"])[0])
+        review = self.job["settings"].get("review_bibliography", False)
+        explicit = self.job["operation"] == "references"
+        inputs = reference_inputs(content["references"], parts, limit=None if review else 40, review=review) if review or explicit else []
+        hints = []
+        if review and "bibliography_review" in content:
+            hints = content["bibliography_review"]
+        elif inputs:
             model = Model(self.optional_http, self.worker.api_key, self.job["settings"], self.model.start_call, self.model.record_usage)
             try:
-                result = model.ask("reference_titles", REFERENCE_SCHEMA, REFERENCE_INSTRUCTIONS, {"references": inputs})
-                apply_reference_hints(content["references"], inputs, result["reference_hints"])
+                if review:
+                    instructions = REFERENCE_INSTRUCTIONS + ("\nПроверь также уже выделенные названия. Возвращай только записи, "
+                                    "которые можно уточнить. В doi и arxiv_id укажи идентификаторы для проверки по метаданным "
+                                    "или пустые строки. Для каждого кандидата сохрани исходный reference_id.")
+                    result = model.ask("bibliography_review", REFERENCE_REVIEW_SCHEMA, instructions, {"references": inputs}, visual=True)
+                    valid_ids = {entry["reference_id"] for entry in inputs}
+                    hints = [hint for hint in result["reference_hints"] if hint["reference_id"] in valid_ids]
+                    content["bibliography_review"] = hints
+                    self.profile.pop("reference_search_note", None)
+                else:
+                    result = model.ask("reference_titles", REFERENCE_SCHEMA, REFERENCE_INSTRUCTIONS, {"references": inputs})
+                    hints = result["reference_hints"]
+                apply_reference_hints(content["references"], inputs, hints)
             except ServiceError as error:
                 self.profile["reference_search_note"] = "Уточнение моделью не завершено: " + str(error)
             self.publish()
-        failures = resolve_reference_titles(self.worker.publications, self.optional_http, content["references"], self.publish)
+        failures = (resolve_reference_titles(self.worker.publications, self.optional_http, content["references"], self.publish,
+                                            review_hints=hints) if review else
+                    resolve_reference_titles(self.worker.publications, self.optional_http, content["references"], self.publish))
         if failures:
             raise ServiceError("; ".join(dict.fromkeys(failures)))
         records = _bibliography_records(self.worker.publications, self.optional_http,
@@ -188,15 +214,19 @@ class Pipeline:
         if missing:
             self.step("references", "failed", f"Для {missing} записей название пока не установлено. Можно повторить уточнение.", "missing_titles")
             return False
+        if review and inputs and "bibliography_review" not in content:
+            raise ServiceError(self.profile["reference_search_note"])
 
     def analogs(self):
         if self.job["settings"]["max_api_calls"] <= self.usage()["calls"]:
-            self.step("analogs", "skipped", ANALOGS_SKIPPED, "call_limit")
+            self.step("analogs", "skipped", "Подбор аналогов пропущен: исчерпан бюджет вызовов модели.", "call_limit")
             return False
         model = Model(self.optional_http, self.worker.api_key, self.job["settings"], self.model.start_call, self.model.record_usage)
         content = self.profile["content"]
+        pages, shared_heading = main_text_pages(self.document["pages"])
+        links = [link for link in self.document["links"] if link["page"] <= len(pages) - bool(shared_heading)]
         search = search_analogs(self.worker.publications, self.optional_http, model, content, self.profile["article"],
-                               split_sections(self.document["pages"]), self.document["links"],
+                               split_sections(pages), links,
                                self.profile["search_terms"], self.job["settings"]["language"])
         search["usage"] = self.usage()
         self.profile["analog_search"] = search
@@ -257,10 +287,14 @@ class Pipeline:
                 cached = self.saved(current)
             self.step("material", "running")
             self.step("core", "running")
+            if cached and cached.get("visual"):
+                self.store.save_checkpoint(job, cached["pdf"], cached["article"], cached["document"])
+                self.store.save_visual_checkpoint(self.job_id, cached["visual"])
             bundle = prepare_profile(job, self.worker.publications, self.http, self.model, self.advance,
                                      lambda version: self.store.set_version(self.job_id, version),
                                      lambda: self.store.uploaded_pdf(job["source"]), current, self.usage,
-                                     cached=cached, save_material=self.save_material)
+                                     cached=cached, save_material=self.save_material,
+                                     save_visual=lambda state: self.store.save_visual_checkpoint(self.job_id, state))
             if bundle is None:
                 self.restore_profile(current, self.saved(current))
                 for key in ("core", "references", "analogs"):

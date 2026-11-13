@@ -2,11 +2,11 @@
 import io
 import math
 import re
-import threading
 import unicodedata
 from contextlib import closing
 
-_PDFIUM_LOCK = threading.Lock()  # PDFium cannot be used by concurrent server threads.
+from pdf_text import PDFIUM_LOCK
+
 _DASHES = str.maketrans("‐‑‒–—−", "------")
 _INVISIBLE = "\u00ad\u200b\u200c\u200d\ufeff"
 
@@ -48,7 +48,7 @@ def _matching_offset(page, text, start, end):
 
 
 def _rectangles(pdfium, raw, page_number, text, start, end):
-    with _PDFIUM_LOCK, pdfium.PdfDocument(raw) as pdf:
+    with PDFIUM_LOCK, pdfium.PdfDocument(raw) as pdf:
         if not 1 <= page_number <= len(pdf):
             return []
         with closing(pdf[page_number - 1]) as page, closing(page.get_textpage()) as textpage:

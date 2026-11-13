@@ -43,7 +43,7 @@ if ($health.mode -eq 'demo') {
 }
 
 Write-Host "Starting Research Agent $releaseVersion. Keep this window open. Ctrl+C stops the server."
-& $pythonPath -c 'import pypdf, pypdfium2, markdown_it' 2>$null
+& $pythonPath -c 'import pypdf, pypdfium2, markdown_it, PIL' 2>$null
 if ($LASTEXITCODE -ne 0) {
     Write-Host 'PDF processing and formatted Markdown preview use packages from requirements.txt. Install them with:'
     Write-Host "& '$pythonPath' -m pip install -r requirements.txt"

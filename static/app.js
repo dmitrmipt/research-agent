@@ -1,7 +1,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const statusNames = {queued:"В очереди",running:"Выполняется",completed:"Завершено",cancelled:"Остановлено",failed:"Ошибка",interrupted:"Прервано"};
-const depthNames = {brief:"16 000 символов",standard:"30 000 символов",deep:"48 000 символов",full:"Полный текст"};
+const depthNames = {brief:"16 000 символов",standard:"30 000 символов",deep:"48 000 символов",full:"Полный текст",vision:"Полный текст + картинки"};
 const stepNames = {material:"Материал",core:"Обзор",references:"Библиография",analogs:"Аналоги",manuscript:"Исходник"};
 const stepStates = {pending:"Ожидает",running:"Выполняется",completed:"Готово",failed:"Ошибка",skipped:"Пропущено",blocked:"Требуется действие",not_applicable:"Не требуется"};
 const effortNames = {auto:"По умолчанию модели",none:"Без дополнительного рассуждения",low:"Низкое · low",medium:"Среднее · medium",high:"Высокое · high",xhigh:"Очень высокое · xhigh",max:"Максимальное · max"};
@@ -52,6 +52,9 @@ document.querySelectorAll("[data-source]").forEach(button=>button.addEventListen
 function fileData(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result.split(",")[1]);reader.onerror=()=>reject(new Error("Не удалось прочитать файл."));reader.readAsDataURL(file);});}
 function renderMode() {
   const demo = $("mode").value === "demo";
+  $("vision-note").hidden = demo || $("depth").value !== "vision";
+  $("bibliography-review-label").hidden = demo;
+  $("bibliography-review-note").hidden = demo;
   $("demo-options").hidden = !demo;
   $("processing-note").hidden = demo;
   if (!$("start-button").disabled) $("start-button").textContent = demo ? "Запустить демонстрацию →" : "Подготовить профиль →";
@@ -62,6 +65,7 @@ function renderMode() {
   $("setup-state").textContent = demo ? "" : messages.join(" ");
 }
 $("mode").addEventListener("change", renderMode);
+$("depth").addEventListener("change", renderMode);
 document.querySelectorAll("[data-question]").forEach(button => button.addEventListener("click", () => {
   const field = $("questions");
   const question = button.textContent.trim();
@@ -89,10 +93,12 @@ $("new-form").addEventListener("submit",async event=>{
   event.preventDefault(); const button=$("start-button");button.disabled=true;button.textContent="Сохранение…";
   try{
     const body={source:$("source").value,questions:$("questions").value,depth:$("depth").value,mode:$("mode").value,
-      settings:{model:$("new-model").value,reasoning_effort:$("new-effort").value}};
+      settings:{model:$("new-model").value,reasoning_effort:$("new-effort").value,
+        review_bibliography:$("mode").value === "research" && $("bibliography-review").checked}};
     if (body.mode === "demo") body.scenario = $("scenario").value;
     if(sourceType==="pdf"){
-      const file=$("pdf").files[0];if(!file)throw new Error("Выберите PDF.");if(file.size>15*1024*1024)throw new Error("Максимальный размер PDF — 15 МБ.");
+      const file=$("pdf").files[0];if(!file)throw new Error("Выберите PDF.");
+      if(body.depth!=="vision" && file.size>15*1024*1024)throw new Error("Для PDF больше 15 МБ выберите «Полный текст + картинки».");
       body.pdf={name:file.name,data:await fileData(file)};
     }
     showJob(await api("/api/jobs", body)); newModelEdited = false;
@@ -114,10 +120,28 @@ function renderJobs(){
   list.replaceChildren();
   if(!filtered.length){list.append(empty("Пока нет заданий","Начните с нового разбора статьи."));return;}
   for(const job of filtered){
+    const row = el("div", undefined, "job-list-row");
     const button=el("button",undefined,"job-item"+(job.id===selectedJob?" selected":""));button.type="button";button.dataset.jobId=job.id;button.setAttribute("aria-pressed",String(job.id===selectedJob));
     button.append(el("strong",job.title),badge(job.status),el("small",date(job.created)+" · "+job.id.slice(0,8)+(job.mode === "demo" ? " · Демо" : "")));
     if (job.result_status === "partial") button.append(el("small", "Частичный результат"));
-    button.addEventListener("click",()=>{selectedJob=job.id;detailKey="";renderJobs();refresh();});list.append(button);
+    button.addEventListener("click",()=>{selectedJob=job.id;detailKey="";renderJobs();refresh();});
+    row.append(button);
+    if (!["running", "queued"].includes(job.status)) {
+      const remove = el("button", "Удалить задание", "job-delete");
+      remove.type = "button";
+      remove.onclick = async () => {
+        if (!window.confirm(`Удалить задание «${job.title}» из истории? Профиль статьи сохранится.`)) return;
+        remove.disabled = true;
+        try {
+          await api(`/api/jobs/${job.id}/delete`, {});
+          if (selectedJob === job.id) { selectedJob = null; detailKey = ""; }
+          await refresh();
+          notify("Задание удалено.");
+        } catch (error) { notify(error.message, true); remove.disabled = false; }
+      };
+      row.append(remove);
+    }
+    list.append(row);
     if(focusedId===job.id)button.focus({preventScroll:true});
   }
 }
@@ -200,7 +224,7 @@ async function renderDetail(){
     if (job.retry?.allowed) panel.append(el("p", `Продолжение: ${job.retry.steps.join(", ")}. ${job.retry.model_needed ? "Возможны вызовы модели и расходы API." : "Вызов модели не требуется."}`, "hint"));
     else if (job.retry?.message && Object.values(job.steps).some(step => step.code === "no_text")) panel.append(el("p", job.retry.message, "hint"));
     panel.append(stepsView(job.steps));
-    if (job.parent_job_id) {
+    if (job.parent_job_id && jobs.some(parent => parent.id === job.parent_job_id)) {
       const parent = el("button", "Исходная попытка · " + job.parent_job_id.slice(0, 8), "secondary"); parent.type = "button";
       parent.onclick = () => { selectedJob = job.parent_job_id; detailKey = ""; renderJobs(); refresh(); };
       panel.append(parent);
@@ -220,7 +244,7 @@ async function renderDetail(){
     "Режим: "+(job.mode === "research" ? "Первичная обработка" : "Демонстрация"),
     "Вопросы: "+(job.questions||"Не указаны"),"Темы: "+(settings.interests||"Не заданы"),"Исключения: "+(settings.exclusions||"Не заданы"),
     "Правила: "+settings.rules,"Язык: "+settings.language,"Лимит времени: "+settings.time_limit_seconds+" с",
-    job.mode === "research" ? `Модель: ${settings.model} · максимум вызовов: ${settings.max_api_calls} · лимит выхода: ${settings.max_output_tokens} токенов на вызов` : `Длительность этапа: ${settings.stage_seconds} с`
+    job.mode === "research" ? `Модель: ${settings.model} · максимум вызовов: ${settings.max_api_calls} · ${job.depth === "vision" ? "выход в пределах лимита модели" : `лимит выхода: ${settings.max_output_tokens} токенов на вызов`}` : `Длительность этапа: ${settings.stage_seconds} с`
   ].join("\n\n"),"snapshot"));panel.append(details);
 }
 function renderPapers(papers){
@@ -394,11 +418,12 @@ function profileSection(section, id, pdfUrl, nested = false) {
   card.dataset.section = section.key;
   const summary = el("summary");
   const title = el(nested ? "h3" : "h2", section.title);
-  if (nested || ["keywords", "claims", "references", "analogs"].includes(section.key)) {
+  if (nested || ["keywords", "claims", "illustrations", "references", "analogs"].includes(section.key)) {
     title.append(el("span", String(section.items.length), "profile-count"));
   }
   summary.append(title);
   const content = el("div", undefined, "profile-section-content");
+  const topics = section.topics || [];
   for (const paragraph of section.paragraphs || []) content.append(mathText(el("p", paragraph), section.math));
   if (section.items.length) {
     const list = el("ul", undefined, "profile-items" + (section.key === "coverage" ? " coverage-facts" : ""));
@@ -417,6 +442,13 @@ function profileSection(section, id, pdfUrl, nested = false) {
       list.append(row);
     }
     content.append(list);
+  }
+  if (topics.length) {
+    const list = el("ul");
+    for (const topic of topics) list.append(mathText(el("li", topic), "inline"));
+    const block = el("div", undefined, "profile-topics");
+    block.append(el("h3", "Темы"), list);
+    content.append(block);
   }
   if (section.steps && Object.keys(section.steps).length) content.append(stepsView(section.steps, true));
   for (const subsection of section.subsections || []) {
@@ -466,7 +498,7 @@ async function renderProfile() {
     actions.append(button);
   }
   if (profile) {
-    actions.append(link("Открыть профиль", base + "/profile.html" + snapshot, "primary", true),
+    actions.append(link("Просмотреть профиль", base + "/profile.html" + snapshot, "primary", true),
       link("Открыть PDF", pdfUrl, "secondary", true),
       link("Скачать профиль .md", `${base}/profile.md${snapshot}`, "secondary"));
     if (profile.article.manuscript?.file === "manuscript.tex") {
@@ -600,6 +632,20 @@ function fillAnalysisSettings(settings) {
   $("analysis-calls").value = settings.max_api_calls;
   $("analysis-time").value = settings.time_limit_seconds;
   $("analysis-output").value = settings.max_output_tokens;
+  syncAnalysisScope(settings.max_api_calls);
+}
+function syncAnalysisScope(calls) {
+  const visual = $("analysis-depth").value === "vision";
+  $("analysis-vision-note").hidden = !visual;
+  $("analysis-calls").disabled = visual;
+  $("analysis-output").disabled = visual;
+  if (visual) {
+    $("analysis-calls").dataset.textValue = calls;
+    $("analysis-calls").value = 6;
+    $("analysis-time").value = Math.max(600, Number($("analysis-time").value));
+  } else {
+    $("analysis-calls").value = calls;
+  }
 }
 async function openAnalysis(kind, target) {
   try {
@@ -624,6 +670,10 @@ async function openAnalysis(kind, target) {
   } catch (error) { notify(error.message, true); }
 }
 $("analysis-close").onclick = () => $("analysis-dialog").close();
+$("analysis-depth").onchange = () => {
+  const calls = $("analysis-calls");
+  syncAnalysisScope(calls.disabled ? calls.dataset.textValue : calls.value);
+};
 $("analysis-preset").onchange = () => fillAnalysisSettings($("analysis-preset").value === "current" ? analysisContext.current : analysisContext.previous.settings);
 $("analysis-model").oninput = () => effortsFor($("analysis-model").value, $("analysis-effort"));
 $("analysis-form").onsubmit = async event => {

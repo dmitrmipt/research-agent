@@ -23,7 +23,8 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import EMPTY_USAGE, Handler, LocalServer, Store, Worker
 from manuscripts import select_manuscript
-from materials import MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _pdf_data, _reference_item, citation_location, document_text, split_sections
+from materials import (MANAGED_FILES, PROFILE_VERSION, MaterialLibrary, _pdf_data, _reference_item,
+                       citation_location, clean_text, document_text, split_sections)
 from pdf_citations import highlighted_pdf
 from publications import Http, Publications, ServiceError
 from research import BIBLIOGRAPHY_MISSING, _candidate_snippets, bibliography, reference_url
@@ -40,21 +41,49 @@ ABSTRACT = "We report calibrated measurements of microwave spectra."
 TEX = b"\\documentclass{article}\n\\begin{document}\n% <script>fixture</script>\nMeasured $x$.\n\\end{document}\n"
 
 
-def pdf_bytes(title, result=QUOTE, *, blank=False):
+def pdf_bytes(title, result=QUOTE, *, blank=False, reference=MOLLOW):
     writer = PdfWriter()
     writer.add_metadata({"/Title": title, "/Author": "A. Physicist; B. Researcher", "/Keywords": "microwave; calibration"})
     page = writer.add_blank_page(612, 792)
     if not blank:
+        face = "/Courier" if "|" in result or "|" in reference else "/Helvetica"
         font = DictionaryObject({NameObject("/Type"): NameObject("/Font"), NameObject("/Subtype"): NameObject("/Type1"),
-                                 NameObject("/BaseFont"): NameObject("/Helvetica")})
+                                 NameObject("/BaseFont"): NameObject(face)})
         page[NameObject("/Resources")] = DictionaryObject({NameObject("/Font"): DictionaryObject({NameObject("/F1"): font})})
         lines = [title, "Abstract: " + ABSTRACT, "Introduction", "Prior experiments are described in [1-3].",
                  "Methods", "We used a calibrated superconducting probe.", "Results", result,
                  "Code availability", "https://github.com/example/fixture", "References",
-                 "[1] Related apparatus arXiv:2301.00002", "[2] Microwave test doi:10.1234/older", "[3] " + MOLLOW]
-        operations = " 0 -20 Td ".join(f"({line}) Tj" for line in lines)
+                 "[1] Related apparatus arXiv:2301.00002", "[2] Microwave test doi:10.1234/older", "[3] " + reference]
+        commands = []
+        for line in lines:
+            if "|" in line:
+                # In Courier this gap is large enough for PDFium but below pypdf's space threshold.
+                chunks = ") -160 (".join(line.split("|"))
+                commands.append(f"[({chunks})] TJ")
+            else:
+                commands.append(f"({line}) Tj")
+        operations = " 0 -20 Td ".join(commands)
         stream = DecodedStreamObject()
         stream.set_data(f"BT /F1 11 Tf 40 740 Td {operations} ET".encode())
+        page[NameObject("/Contents")] = writer._add_object(stream)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def illustrated_pdf(*, shared=False):
+    writer = PdfWriter()
+    writer.add_metadata({"/Title": "Illustrated article"})
+    writer.append(PdfReader(io.BytesIO(pdf_bytes("Illustrated article", QUOTE + "\nFig. 1. Measured spectra."))))
+    font = writer.pages[0]["/Resources"]
+    lines = ["Fig. 2. Measurement setup.", "Supplementary Information", "SUPPLEMENT ONLY TOKEN"] if shared else [
+        "Fig. 2. Measurement setup.", "Appendix A: Calibrated probe", "Details of the main manuscript."]
+    for page_lines in [lines] + ([] if shared else [["Supplementary Information", "SUPPLEMENT ONLY TOKEN"]]):
+        page = writer.add_blank_page(612, 792)
+        page[NameObject("/Resources")] = font
+        stream = DecodedStreamObject()
+        text = " 0 -30 Td ".join(f"({line}) Tj" for line in page_lines)
+        stream.set_data(f"0.3 0.5 0.8 rg 50 751 120 15 re f 0 0 0 rg BT /F1 11 Tf 40 740 Td {text} ET".encode())
         page[NameObject("/Contents")] = writer._add_object(stream)
     buffer = io.BytesIO()
     writer.write(buffer)
@@ -132,7 +161,7 @@ class ResearchTest(TempTest):
         self.resume_model = threading.Event()
         self.resume_model.set()
         self.patchers = [patch("publications.Http.read", autospec=True, side_effect=self.fixture_http),
-                         patch("publications.ARXIV_QUERY_INTERVAL", 0)]
+                         patch("publications.ARXIV_QUERY_INTERVAL", 0), patch("publications.CROSSREF_QUERY_INTERVAL", 0)]
         for patcher in self.patchers:
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -195,6 +224,7 @@ class ResearchTest(TempTest):
                                    "../../paper.tex": TEX, "section.tex": b"\\section{Introduction}"})
         if parts.hostname == "api.crossref.org":
             journal = citation("10.1234/journal", "Journal comparison", "The experiment compares two microwave probe spectra.")
+            journal["link"] = [{"URL": "https://journals.example/comparison.pdf", "content-type": "application/pdf"}]
             if parts.path == "/works":
                 self.crossref_queries.append(query["query.bibliographic"][0])
                 if query["query.bibliographic"][0] == MOLLOW:
@@ -207,6 +237,9 @@ class ResearchTest(TempTest):
                     return json.dumps({"message": {"items": [other, match]}}).encode()
                 return json.dumps({"message": {"items": [journal, citation("10.1234/no-text", "Metadata only", "")]}}).encode()
             return json.dumps({"message": citation("10.1234/older", "Cited apparatus", "The authors report a microwave calibration.")}).encode()
+        if parts.hostname == "journals.example" and parts.path in {"/comparison.pdf", "/mollow.pdf"}:
+            return pdf_bytes("Journal comparison" if parts.path == "/comparison.pdf" else "Mollow full text",
+                             "The journal measured independent calibration spectra at 25 mK.")
         if parts.hostname == "api.openai.com":
             if parts.path == "/v1/models":
                 if self.fail_catalog:
@@ -220,14 +253,23 @@ class ResearchTest(TempTest):
                 raise ServiceError("OpenAI: HTTP 401. Проверьте ключ API.")
             self.assertFalse(request["store"])
             self.assertTrue(request["text"]["format"]["strict"])
-            inputs = json.loads(request["input"])
-            if request["text"]["format"]["name"] == "reference_titles":
+            multimodal = isinstance(request["input"], list)
+            inputs = json.loads(request["input"][0]["content"][0]["text"] if multimodal else request["input"])
+            name = request["text"]["format"]["name"]
+            illustrations = [{**item, "description": "Измеренные спектры.", "connection": "Сравнение из раздела результатов.",
+                              "result": "Разница 4 дБ."} for item in inputs.get("inventory", [])]
+            if name == "article_part":
+                return responses({"notes": "Проверены страницы " + str(inputs["page_range"]), "illustrations": illustrations})
+            if name == "bibliography_review":
+                return responses({"reference_hints": [{"reference_id": "r3", "title": "", "evidence": "",
+                                                        "search_query": MOLLOW, "doi": "", "arxiv_id": ""}]})
+            if name == "reference_titles":
                 return responses({"reference_hints": [{"reference_id": entry["reference_id"], "title": "", "evidence": "",
                                                         "search_query": entry["text"]} for entry in inputs["references"]]})
-            if request["text"]["format"]["name"] == "article_profile":
+            if name == "article_profile":
                 self.model_arrived.set()
                 self.resume_model.wait(8)
-                snippet = next(part for part in inputs["snippets"] if QUOTE in part["text"])
+                snippet = next((part for part in inputs.get("snippets", []) if QUOTE in part["text"]), {"id": "p1"})
                 claim = {"statement": "Измерена разница 4 дБ.", "kind": "measurement", "snippet": snippet["id"],
                          "evidence": QUOTE, "locator": "Несуществующий рисунок 9", "check": "Проверить калибровку.",
                          "explanation": r"Разница относится к измеренным спектрам. \[\Delta=4\,\mathrm{dB}\]"}
@@ -247,7 +289,8 @@ class ResearchTest(TempTest):
                                                for term, weight in [("microwave", 5), ("probe", 4), ("calibration", 3), ("spectra", 2), ("temperature", 1)]],
                                   "topics": [r"Микроволновые измерения при $\omega_0$"],
                                   "claims": [claim, {**claim, "statement": "Выдуманное утверждение.", "evidence": "A fabricated sentence."}],
-                                  "search_terms": ["microwave probe", "superconducting spectra"], "reference_hints": []})
+                                  "search_terms": ["microwave probe", "superconducting spectra"], "reference_hints": [],
+                                  **({"illustrations": illustrations} if multimodal else {})})
             if self.empty_analogs:
                 return responses({"analogs": []})
             self.assertNotIn("evidence", request["text"]["format"]["schema"]["properties"]["analogs"]["items"]["properties"])
@@ -272,7 +315,8 @@ class ResearchTest(TempTest):
             return response.read() if raw else json.load(response)
 
     def settled(self, job):
-        deadline = time.monotonic() + 12
+        # A single job can start several PDF extraction processes on Windows.
+        deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             result = self.call("/api/jobs/" + job["id"])
             if result["status"] not in {"queued", "running"}:
@@ -417,14 +461,15 @@ class ResearchTest(TempTest):
         self.assertEqual((citation["page"], citation["label"]), (1, "с. 1 · Введение"))
         self.assertIn("Prior experiments are described in [1-3]", citation["context"])
         matches = {entry["title"]: entry for entry in content["analogs"]}
-        self.assertIn("Cited apparatus", matches)
-        self.assertIn("предварительно", matches["Journal comparison"]["basis"])
+        self.assertNotIn("Cited apparatus", matches)
+        self.assertEqual(matches["Journal comparison"]["pdf_url"], "https://journals.example/comparison.pdf")
         self.assertIn("основного текста", matches["Calibrated microwave probe"]["basis"])
-        self.assertIn("Power spectrum of light scattered by two-level systems", matches)
+        self.assertNotIn("Power spectrum of light scattered by two-level systems", matches)
         search = profile["analog_search"]
         self.assertEqual(search["records"], 6)
-        self.assertEqual(search["candidates"], 5)
-        self.assertEqual(search["accepted"], 5)
+        self.assertEqual(search["candidates"], search["full_text"])
+        self.assertEqual(search["accepted"], len(matches))
+        self.assertTrue(all(match["page"] and match["pdf_url"] for match in matches.values()))
         self.assertEqual(search["rejected"], [{"title": "fabricated", "reason": "Неизвестный идентификатор кандидата."},
                                               {"title": "Calibrated microwave probe", "reason": "Неизвестный фрагмент кандидата."}])
         self.assertEqual(self.call(path + "/article.pdf", raw=True), raw)
@@ -810,6 +855,134 @@ class ResearchTest(TempTest):
         self.assertEqual(final["steps"]["references"]["code"], "time_limit")
 
 
+    def test_reference_lookup_reextracts_old_spacing_cache(self):
+        raw = pdf_bytes("Spacing cache", QUOTE + " A calibrated|quantum|probe also cites [1-3].",
+                        reference="B. R. Mollow, Physical|Review 188, 1969 (1969).")
+        first = self.uploaded(raw)
+        self.assertEqual(self.settled(first)["status"], "completed")
+        path = "/api/papers/" + first["paper_id"]
+        paper = self.call(path)
+        snippets = json.loads(self.requests[0]["input"])["snippets"]
+        self.assertTrue(any("calibrated quantum probe" in part["text"] for part in snippets))
+        profile = paper["profile"]
+        reference = profile["content"]["references"][2]
+        self.assertEqual(reference["text"], MOLLOW)
+        reference["text"] = reference["text"].replace("Physical Review", "PhysicalReview")
+        cache_file = Path(paper["directory"]) / "document.json"
+        cache = json.loads(cache_file.read_text(encoding="utf-8"))
+        cache["document"]["pages"] = [clean_text(PdfReader(io.BytesIO(raw)).pages[0].extract_text())]
+        store = self.server.store
+        with store.lock:
+            store.materials.publish(first["source"], raw, document_text(cache["document"]), profile)
+            cache["version"] = 1
+            cache_file.write_text(json.dumps(cache), encoding="utf-8")
+
+        repeated = self.settled(self.call(path + "/references", {}))
+        self.assertEqual(repeated["status"], "completed", repeated["error"])
+        final = self.call(path)["profile"]
+        self.assertEqual(final["content"]["summary"], profile["content"]["summary"])
+        repaired = final["content"]["references"][2]
+        self.assertEqual(repaired["text"], MOLLOW)
+        self.assertEqual(repaired["title"], reference["title"])
+        self.assertEqual(repaired["url"], reference["url"])
+        text = store.materials.read(first["source"], "text.txt")
+        self.assertIn(b"calibrated quantum probe", text)
+        self.assertEqual(len(repaired["citations"]), 2)
+        for mention in repaired["citations"]:
+            self.assertNotEqual(highlighted_pdf(raw, *citation_location(text, mention["anchor"])), raw)
+
+    def test_visual_review_sends_main_pdf_and_publishes_illustrations(self):
+        job = self.uploaded(illustrated_pdf(), depth="vision")
+        self.assertEqual(job["settings"]["time_limit_seconds"], 600)
+        self.assertEqual(job["settings"]["max_api_calls"], 6)
+        result = self.settled(job)
+        self.assertEqual(result["status"], "completed", result["error"])
+        request = self.requests[0]
+        self.assertNotIn("max_output_tokens", request)
+        parts = request["input"][0]["content"]
+        self.assertEqual(parts[1]["type"], "input_file")
+        attachment = PdfReader(io.BytesIO(base64.b64decode(parts[1]["file_data"].split(",", 1)[1])))
+        self.assertEqual(len(attachment.pages), 2)
+        self.assertIn("Details of the main manuscript", attachment.pages[1].extract_text())
+        self.assertNotIn("SUPPLEMENT ONLY TOKEN", parts[0]["text"])
+        profile = self.call("/api/papers/" + job["paper_id"])
+        records = profile["profile"]["content"]["illustrations"]
+        self.assertEqual([(item["number"], item["page"]) for item in records], [("1", 1), ("2", 2)])
+        html = self.call("/api/papers/" + job["paper_id"] + "/profile.html", raw=True).decode()
+        self.assertIn("Анализ иллюстраций", html)
+        self.assertIn("Страница 2 PDF", html)
+        self.assertIn("<h3>Темы</h3>", html)
+
+    def test_visual_review_resumes_completed_pages_and_splits_on_context_error(self):
+        attempts = []
+        failed_second = False
+        def reject_then_interrupt(http, url, service, **kwargs):
+            nonlocal failed_second
+            if url.endswith("/v1/responses"):
+                request = json.loads(kwargs["data"])
+                if isinstance(request["input"], list):
+                    pages = json.loads(request["input"][0]["content"][0]["text"])["page_range"]
+                    attempts.append(pages)
+                    if pages == [1, 2]:
+                        raise ServiceError("Context exceeded", 400, code="context_length_exceeded")
+                    if pages == [2, 2] and not failed_second:
+                        failed_second = True
+                        raise ServiceError("Model unavailable", 403)
+            return self.fixture_http(http, url, service, **kwargs)
+
+        with patch("publications.Http.read", new=reject_then_interrupt):
+            job = self.uploaded(illustrated_pdf(shared=True), depth="vision")
+            first = self.settled(job)
+            self.assertEqual(first["status"], "failed", first["error"])
+            self.assertEqual(first["api_usage"]["calls"], 3)
+            repeated = self.settled(self.call("/api/jobs/" + job["id"] + "/retry", {}))
+            self.assertEqual(repeated["status"], "completed", repeated["error"])
+        self.assertEqual(attempts, [[1, 2], [1, 1], [2, 2], [2, 2]])
+        part = next(request for request in self.requests if isinstance(request["input"], list)
+                    and request["input"][0]["content"][1]["type"] == "input_image")
+        self.assertNotIn("SUPPLEMENT ONLY TOKEN", part["input"][0]["content"][0]["text"])
+        profile = self.call("/api/papers/" + job["paper_id"])["profile"]
+        self.assertEqual(len(profile["content"]["illustrations"]), 2)
+
+    def test_text_review_excludes_supplement_and_job_delete_preserves_profile(self):
+        job = self.uploaded(illustrated_pdf(), depth="full")
+        finished = self.settled(job)
+        self.assertEqual(finished["status"], "completed", finished["error"])
+        self.assertNotIn("SUPPLEMENT ONLY TOKEN", self.requests[0]["input"])
+        self.assertIn("Details of the main manuscript", self.requests[0]["input"])
+        path = "/api/papers/" + job["paper_id"]
+        before = self.call(path)["profile"]
+        self.assertTrue(self.call("/api/jobs/" + job["id"] + "/delete", {})["deleted"])
+        self.assertFalse(any(item["id"] == job["id"] for item in self.call("/api/jobs")))
+        self.assertEqual(self.call(path)["profile"], before)
+        self.assertEqual(self.call(path + "/article.pdf", raw=True), illustrated_pdf())
+
+    def test_opt_in_bibliography_review_makes_one_call_and_keeps_verified_pdf(self):
+        pdf = "https://journals.example/mollow.pdf"
+        def add_pdf_metadata(http, url, service, **kwargs):
+            data = self.fixture_http(http, url, service, **kwargs)
+            if service == "Поиск Crossref" and parse_qs(urlsplit(url).query).get("query.bibliographic") == [MOLLOW]:
+                payload = json.loads(data)
+                for record in payload["message"]["items"]:
+                    record["link"] = [{"URL": pdf, "content-type": "application/pdf"}]
+                return json.dumps(payload).encode()
+            return data
+
+        with patch("publications.Http.read", new=add_pdf_metadata):
+            job = self.uploaded(pdf_bytes("Bibliography audit", reference=MOLLOW + " Misparsed title."),
+                                settings={"review_bibliography": True})
+            self.assertEqual(job["settings"]["max_api_calls"], 3)
+            result = self.settled(job)
+            self.assertEqual(result["status"], "completed", result["error"])
+        audit, = [request for request in self.requests if request["text"]["format"]["name"] == "bibliography_review"]
+        self.assertEqual(len(json.loads(audit["input"])["references"]), 3)
+        profile = self.call("/api/papers/" + job["paper_id"])["profile"]
+        reference = profile["content"]["references"][2]
+        self.assertEqual(reference["title"], "Power spectrum of light scattered by two-level systems")
+        self.assertEqual(reference["url"], pdf)
+        self.assertEqual(len(reference["citations"]), 1)
+
+
 class StorageTest(TempTest):
     def test_legacy_folder_is_renamed_with_author_and_title_and_keeps_files(self):
         library, source, _, pdf = self._save_old_profile(["Article text"], schema_version=PROFILE_VERSION)
@@ -1027,6 +1200,50 @@ class StorageTest(TempTest):
 
 
 class ParsingTest(unittest.TestCase):
+    def test_crossref_pause_applies_to_search_and_doi_requests(self):
+        provider = Publications()
+        http = Http(lambda: 100)
+        with patch("publications.time.monotonic", return_value=100) as clock, patch.object(
+            http, "json", side_effect=[ServiceError("429", 429, retry_after=17), {"message": {"items": []}}]
+        ) as request:
+            with self.assertRaises(ServiceError) as rejected:
+                provider.crossref_reference(http, "10.1234/example")
+            self.assertEqual(rejected.exception.retry_after, 17)
+            clock.return_value = 110
+            with self.assertRaises(ServiceError) as paused:
+                provider.crossref_search(http, ["example"])
+            self.assertTrue(paused.exception.deferred)
+            self.assertEqual(request.call_count, 1)
+            clock.return_value = 117
+            self.assertEqual(provider.crossref_search(http, ["example"]), [])
+            self.assertEqual(request.call_count, 2)
+
+    def test_pdf_extraction_restores_word_spaces_and_keeps_highlight_geometry(self):
+        reference = "Thiago|Bergamaschi. The|stationarity|test: a framework for learning quantum many-body systems. Journal of Tests, 2026."
+        raw = pdf_bytes("Repeated citations", QUOTE + " The calibrated|quantum|probe also cites [1-3].", reference=reference)
+        before = clean_text(PdfReader(io.BytesIO(raw)).pages[0].extract_text())
+        self.assertIn("ThiagoBergamaschi. Thestationaritytest", before)
+        after, = _pdf_data(raw)["pages"]
+        expected = (before.replace("calibratedquantumprobe", "calibrated quantum probe")
+                    .replace(reference.replace("|", ""), reference.replace("|", " ")))
+        self.assertEqual(after, expected)
+        old_parts, new_parts = split_sections([before]), split_sections([after])
+        entries = bibliography(new_parts)
+        item = _reference_item(entries[2])
+        self.assertEqual(item["authors"], "Thiago Bergamaschi")
+        self.assertEqual(item["label"], "The stationarity test: a framework for learning quantum many-body systems")
+        old_mentions = bibliography(old_parts)[2]["citations"]
+        new_mentions = entries[2]["citations"]
+        self.assertEqual(len(old_mentions), 2)
+        self.assertEqual(len(new_mentions), 2)
+        self.assertNotEqual(old_mentions[1]["anchor"], new_mentions[1]["anchor"])
+        for old, new in zip(old_mentions, new_mentions):
+            original = citation_location(document_text({"pages": [before]}).encode(), old["anchor"])
+            repaired = citation_location(document_text({"pages": [after]}).encode(), new["anchor"])
+            marked = highlighted_pdf(raw, *original)
+            self.assertNotEqual(marked, raw)
+            self.assertEqual(highlighted_pdf(raw, *repaired), marked)
+
     def test_pdf_highlight_distinguishes_two_mentions_on_the_same_page(self):
         raw = pdf_bytes("Repeated citations", QUOTE + " The result also cites [1-3].")
         document = _pdf_data(raw)

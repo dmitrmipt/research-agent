@@ -3,6 +3,7 @@
 Install requirements-dev.txt and run `python -m playwright install chromium` first.
 """
 import argparse
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from playwright.sync_api import expect, sync_playwright
-from test_research import ABSTRACT, FOCAL, QUOTE, ResearchTest, pdf_bytes
+from test_research import ABSTRACT, FOCAL, QUOTE, ResearchTest, illustrated_pdf, pdf_bytes
 
 
 def check_layout(page, label):
@@ -100,7 +101,7 @@ def check_design(page, fixture, paper_id, screenshots):
 
     page.set_viewport_size({"width": 1440, "height": 1000})
     for name, selector in (
-        ("document", '#paper-profile a[href*="profile.html"]'),
+        ("document", '#paper-profile a:has-text("Просмотреть профиль")'),
         ("manuscript", '#paper-profile a[href*="manuscript.html"]'),
         ("citation", '.reference-mention'),
     ):
@@ -125,6 +126,8 @@ def check_design(page, fixture, paper_id, screenshots):
             continue
         expect(document.locator(".profile-document")).to_be_visible()
         if name == "document":
+            expect(document).to_have_url(re.compile(r"/profile\.html\?snapshot="))
+            expect(document.locator(".profile-document h1")).to_contain_text("Fixture focal article")
             expect(document.locator(".formula-display mfrac")).to_be_visible()
             expect(document.locator(".formula-inline msub").first).to_be_visible()
         for width in (1440, 390):
@@ -201,6 +204,8 @@ def run(channel=None, screenshots=None):
             keywords = page.locator('[data-section="keywords"]')
             keywords.locator(":scope > summary").click()
             expect(keywords.locator(".formula-inline msub")).to_be_visible()
+            expect(keywords.locator(".profile-topics h3")).to_have_text("Темы")
+            assert keywords.locator(".profile-topics").bounding_box()["width"] >= keywords.locator(".profile-items").bounding_box()["width"] - 1
             keywords.locator(":scope > summary").click()
             assert page.evaluate(r"""() => {
                 const node = document.createElement('div');
@@ -247,6 +252,26 @@ def run(channel=None, screenshots=None):
             expect(page.locator("#new-model")).to_have_value("gpt-6-luna")
             expect(page.locator("#new-effort")).to_have_value("medium")
             check_design(page, fixture, first["paper_id"], screenshots or Path(tempfile.gettempdir()) / "research-agent-design")
+            page.goto(fixture.url + "#new")
+            page.locator("#depth").select_option("vision")
+            expect(page.locator("#vision-note")).to_be_visible()
+            expect(page.locator("#bibliography-review")).not_to_be_checked()
+            visual = fixture.uploaded(illustrated_pdf(), depth="vision")
+            assert fixture.settled(visual)["status"] == "completed"
+            page.goto(fixture.url + "#paper/" + visual["paper_id"])
+            figures = page.locator('[data-section="illustrations"]')
+            figures.locator(":scope > summary").click()
+            expect(figures.locator(".profile-entry")).to_have_count(2)
+            figures.locator(".profile-entry-summary").last.click()
+            expect(figures.get_by_role("link", name="Страница 2 PDF")).to_have_attribute("href", re.compile(r"#page=2$"))
+            expect(figures.locator(".profile-entry-facts").last).to_contain_text("Разница 4 дБ.")
+            page.goto(fixture.url + "#jobs")
+            row = page.locator(".job-list-row").filter(has=page.locator(f'[data-job-id="{visual["id"]}"]'))
+            page.once("dialog", lambda dialog: dialog.accept())
+            row.get_by_role("button", name="Удалить задание").click()
+            expect(row).to_have_count(0)
+            page.goto(fixture.url + "#paper/" + visual["paper_id"])
+            expect(page.locator("#paper-profile h1")).to_contain_text("Illustrated article")
             assert not errors, errors
             browser.close()
         print("Browser checks passed: models, keyboard, settings, analysis, reanalysis, continuation; all pages at 1440/768/390/320px; menus, disclosures, fonts, Markdown, TeX and citations.")

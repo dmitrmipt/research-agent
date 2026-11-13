@@ -1,10 +1,18 @@
 import unittest
+from unittest.mock import patch
 
 from materials import render_markdown_preview
 from math_markup import MATH_HEADER, escape_markdown
 
 
 class MathMarkupTest(unittest.TestCase):
+    def test_missing_markdown_renderer_offers_download_and_setup(self):
+        with patch.dict("sys.modules", {"markdown_it": None}):
+            html = render_markdown_preview(b"# Article title", "current revision")
+        self.assertIn("pip install -r requirements.txt", html)
+        self.assertIn('href="profile.md?snapshot=current%20revision"', html)
+        self.assertNotIn("# Article title", html)
+
     def test_legacy_markdown_decodes_escaped_tex_inside_profile_sections(self):
         old = ("## Краткий обзор\n\n" + r"Формула $$\\frac{x\_1}{y}$$." +
                "\n\n## Список литературы\n\n" + r"Запись $x\_1$.")

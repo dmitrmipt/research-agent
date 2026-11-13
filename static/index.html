@@ -41,7 +41,7 @@
         </div>
         <div id="pdf-input" hidden>
           <label for="pdf">PDF с вашего компьютера</label><input id="pdf" type="file" accept="application/pdf,.pdf">
-          <p class="hint">До 15 МБ. Текст извлекается из текстового слоя PDF.</p>
+          <p class="hint">Для PDF больше 15 МБ выберите «Полный текст + картинки».</p>
         </div>
         <div class="form-divider"></div><h2>Фокус внимания</h2>
         <label for="questions">Что особенно важно проверить? <span class="optional">необязательно</span></label><textarea id="questions" rows="3" maxlength="12000" aria-describedby="questions-hint" placeholder="При каких условиях справедливы выводы?"></textarea>
@@ -53,7 +53,8 @@
           <button type="button" class="secondary" data-question>Что нужно для воспроизведения результата?</button>
         </div>
         <div class="field-row">
-          <div><label for="depth">Охват текста статьи</label><select id="depth"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option><option value="full">Передавать полный текст</option></select></div>
+          <div><label for="depth">Охват текста статьи</label><select id="depth" aria-describedby="vision-note"><option value="brief">Небольшой · 16 000 символов</option><option value="standard" selected>Стандартный · 30 000 символов</option><option value="deep">Расширенный · 48 000 символов</option><option value="full">Передавать полный текст</option><option value="vision">Полный текст + картинки</option></select>
+            <p id="vision-note" class="vision-note" hidden><span aria-hidden="true">⚠</span> Основной PDF передаётся модели. Разбор может занять больше времени и стоить дороже.</p></div>
           <div><label for="mode">Режим</label><select id="mode"><option value="research">Подготовить профиль</option><option value="demo">Демонстрация</option></select></div>
         </div>
         <p class="hint">С лимитом для длинной статьи отбираются фрагменты по разделам и вашим вопросам. Полный режим отправляет весь извлечённый текст одним запросом. Для слишком большого запроса понадобится выбрать лимит. Библиография обрабатывается отдельно.</p>
@@ -62,6 +63,8 @@
           <div><label for="new-effort">Усилие анализа</label><select id="new-effort"><option value="low">Низкое · low</option></select></div>
         </div>
         <p class="hint" id="new-model-note">Начальные значения берутся из настроек. Выбор здесь применяется только к этой статье.</p>
+        <label class="checkbox-label" id="bibliography-review-label"><input id="bibliography-review" type="checkbox"> Проверить библиографию моделью</label>
+        <p class="hint" id="bibliography-review-note">Один дополнительный вызов для проверки названий и поиска ссылок на полный текст. Ссылки проверяются по метаданным.</p>
         <div id="demo-options" hidden><label for="scenario">Сценарий демонстрации</label><select id="scenario"><option value="success">Успешное завершение</option><option value="error">Ошибка на этапе поиска</option></select></div>
         <p class="hint" id="processing-note">Фрагменты текста и ваши вопросы передаются в OpenAI, поисковые термины — в arXiv и Crossref. Вызовы модели могут расходовать средства API.</p>
         <p class="hint" id="setup-state" role="status"></p>
@@ -133,12 +136,12 @@
         <p class="hint">Усилие управляет рассуждением модели. Высокие значения могут увеличить время и расход токенов. Охват текста задаётся отдельно для статьи.</p>
         <details id="manual-model-details"><summary>Другой идентификатор модели</summary><label for="manual-model">Идентификатор</label><input id="manual-model" maxlength="120" placeholder="Введите модель"><button type="button" id="manual-model-apply" class="secondary">Выбрать</button><p class="hint">Для неизвестных моделей цена и совместимость не подтверждены; усилие — по умолчанию.</p><p id="other-models" class="hint"></p></details>
         <div class="field-row">
-          <div><label for="max_api_calls">Максимум вызовов на задание</label><input id="max_api_calls" type="number" min="1" max="2" required></div>
+          <div><label for="max_api_calls">Максимум вызовов на задание</label><input id="max_api_calls" type="number" min="1" max="6" required></div>
           <div><label for="max_output_tokens">Лимит выходных токенов на вызов</label><input id="max_output_tokens" type="number" min="1000" max="12000" required></div>
         </div>
         <p class="hint">При первичном разборе первый вызов готовит обзор, второй сравнивает публикации. При продолжении лимит относится к недостающим этапам нового задания.</p>
         <div class="field-row">
-          <div><label for="time_limit_seconds">Лимит обработки, секунды</label><input id="time_limit_seconds" type="number" min="5" max="600" required></div>
+          <div><label for="time_limit_seconds">Лимит обработки, секунды</label><input id="time_limit_seconds" type="number" min="5" max="3600" required></div>
           <div><label for="stage_seconds">Длительность этапа демонстрации, секунды</label><input id="stage_seconds" type="number" min="1" max="10" required></div>
         </div>
         <p class="hint">Время отсчитывается с начала обработки. Остановка задания прекращает последующие запросы. Уже отправленный запрос может расходовать средства API.</p>
@@ -154,10 +157,11 @@
         <p id="analysis-description" class="hint"></p>
         <label for="analysis-preset">Начальные настройки</label><select id="analysis-preset"><option value="previous">Из предыдущего разбора</option><option value="current">Текущие общие настройки</option></select>
         <div id="analysis-questions-wrap"><label for="analysis-questions">Вопросы и фокус</label><textarea id="analysis-questions" rows="4" maxlength="12000"></textarea>
-          <label for="analysis-depth">Охват текста</label><select id="analysis-depth"><option value="brief">16 000 символов</option><option value="standard">30 000 символов</option><option value="deep">48 000 символов</option><option value="full">Передавать полный текст</option></select></div>
+          <label for="analysis-depth">Охват текста</label><select id="analysis-depth" aria-describedby="analysis-vision-note"><option value="brief">16 000 символов</option><option value="standard">30 000 символов</option><option value="deep">48 000 символов</option><option value="full">Передавать полный текст</option><option value="vision">Полный текст + картинки</option></select></div>
+        <p id="analysis-vision-note" class="vision-note" hidden><span aria-hidden="true">⚠</span> Основной PDF передаётся модели. До 6 вызовов, от 600 секунд на разбор. Расходы могут вырасти.</p>
         <label for="analysis-model">Модель</label><input id="analysis-model" list="analysis-models" maxlength="120" required><datalist id="analysis-models"></datalist>
         <label for="analysis-effort">Усилие анализа</label><select id="analysis-effort"></select>
-        <div class="field-row"><div><label for="analysis-calls">Максимум вызовов</label><input id="analysis-calls" type="number" min="1" max="2" required></div><div><label for="analysis-time">Лимит времени, с</label><input id="analysis-time" type="number" min="5" max="600" required></div></div>
+        <div class="field-row"><div><label for="analysis-calls">Максимум вызовов</label><input id="analysis-calls" type="number" min="1" max="6" required></div><div><label for="analysis-time">Лимит времени, с</label><input id="analysis-time" type="number" min="5" max="3600" required></div></div>
         <label for="analysis-output">Лимит выходных токенов на вызов</label><input id="analysis-output" type="number" min="1000" max="12000" required>
         <p id="analysis-error" class="error-box" role="alert" hidden></p>
         <div class="form-footer"><span>Параметры сохранятся в новом задании.</span><button type="submit" id="analysis-submit" class="primary">Начать разбор</button></div>

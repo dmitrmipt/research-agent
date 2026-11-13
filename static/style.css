@@ -325,6 +325,8 @@ input[type="file"]::file-selector-button { padding: 8px 12px; margin-right: 12px
 .job-item.selected { border-left-color: var(--accent); background: var(--accent-light); border-radius: 0 5px 5px 0; }
 .job-item strong { display: block; margin-bottom: 12px; font: 700 18px/1.4 var(--serif); overflow-wrap: anywhere; }
 .job-item small { display: block; margin-top: 10px; color: var(--muted); font: 10px/1.6 var(--mono); overflow-wrap: anywhere; }
+.job-delete { display: block; margin: 0 0 10px auto; padding: 3px 6px; border: 0; background: transparent; color: var(--muted); font-size: 12px; }
+.job-delete:hover { color: #a04828; text-decoration: underline; }
 .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; line-height: 1.5; background: #eceae3; color: #5f645f; white-space: nowrap; }
 .badge.running { color: var(--accent); background: #dfe6ff; }
 .badge.completed { color: var(--success); background: #e5f0e6; }
@@ -432,6 +434,15 @@ summary { padding: 6px 0; cursor: pointer; color: var(--accent); }
 .formula-display { display: block; margin-block: .7em; padding-block: .2em; text-align: center; }
 [data-section="keywords"] .profile-items { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
 [data-section="keywords"] .profile-items li { padding: 12px 14px; border: 1px solid var(--line); border-radius: 4px; font-size: 13px; }
+.profile-topics { margin-top: 16px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 4px; }
+.profile-topics h3 { margin: 0 0 6px; font-size: 15px; }
+.profile-topics ul { margin: 0; padding-inline-start: 20px; overflow-wrap: anywhere; }
+.profile-topics li + li { margin-top: 4px; }
+.vision-note { font-size: 13px; margin: 8px 0 0; }
+.vision-note span { color: var(--warm, #a04828); margin-inline-end: 4px; }
+.checkbox-label { display: flex; align-items: center; gap: 9px; }
+.checkbox-label input { width: auto; accent-color: var(--accent); }
+.checkbox-label[hidden] { display: none; }
 .reference-entry { display: grid; grid-template-columns: minmax(28px, max-content) minmax(0, 1fr); gap: 12px; font-size: 14px; line-height: 1.6; }
 .reference-number { font: 11px/2 var(--mono); color: var(--muted); }
 .reference-publication, .reference-citations { color: var(--muted); font-size: 12px; }
