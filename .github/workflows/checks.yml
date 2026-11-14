@@ -20,11 +20,59 @@ jobs:
       - run: node --check static/app.js
   browser:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        engine: [chromium, firefox]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m playwright install --with-deps chromium
-      - run: python tests/browser_smoke.py
+      - run: python -m playwright install --with-deps ${{ matrix.engine }}
+      - run: python tests/browser_smoke.py --engine ${{ matrix.engine }}
+  windows-launcher:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-windows.txt
+      - run: ./build-windows.ps1
+      - run: python tests/windows_bundle_smoke.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ResearchAgent-windows
+          include-hidden-files: true
+          path: |
+            ResearchAgent.exe
+            runtime/
+            Dockerfile
+            .dockerignore
+            compose.yaml
+            requirements.txt
+            *.py
+            static/
+            start.cmd
+            start.ps1
+            README.md
+            CHANGELOG.md
+            screen.png
+            LICENSE
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose up -d --build --wait --wait-timeout 60
+      - run: |
+          curl -fsS http://127.0.0.1:8765/api/health | jq -e '.worker_alive and .pdf_configured and .instance == "research-agent-compose"'
+          test -f data/research.sqlite3
+          test -d Materials
+          job=$(curl -fsS http://127.0.0.1:8765/api/jobs -H 'Content-Type: application/json' -d '{"source":"2409.10975","mode":"demo","settings":{"stage_seconds":10}}' | jq -er '.id')
+          docker compose stop
+          test -f data/research.sqlite3
+          docker compose up -d --wait --wait-timeout 60
+          curl -fsS "http://127.0.0.1:8765/api/jobs/$job" | jq -e '.status == "interrupted"'
+      - if: always()
+        run: docker compose down

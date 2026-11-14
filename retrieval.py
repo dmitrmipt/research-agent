@@ -8,7 +8,7 @@ from collections import Counter
 VERSION = 1
 CHUNK_SIZE = 2000
 OVERLAP = 200
-BUDGETS = {"brief": 16_000, "standard": 30_000, "deep": 48_000, "full": None}
+BUDGETS = {"brief": 16_000, "standard": 30_000, "deep": 48_000, "full": None, "vision": None}
 EXCLUDED = {"Библиография", "Благодарности"}
 # Small, explicit cross-language aliases; no remote translation or inference.
 ALIASES = {

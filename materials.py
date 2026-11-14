@@ -9,27 +9,29 @@ import shutil
 import subprocess
 import sys
 import time
-from html import escape
+import unicodedata
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlsplit
 
 from manuscripts import SOURCE_FILES
 from bibliographic import reference_text
+from math_markup import MATH_HEADER, escape_markdown, markdown_math
+from pdf_text import pdfium_document, restore_word_spaces
 from version import VERSION
 
 PDF_LIMIT = 15 * 1024 * 1024
 PAGE_LIMIT = 200
 TEXT_LIMIT = 1_500_000
 MANAGED_FILES = ("article.pdf", "text.txt", "profile.md", "profile.json", "document.json", *SOURCE_FILES)
-PROFILE_VERSION = 9
-EXTRACTION_VERSION = 1
+PROFILE_VERSION = 10
+EXTRACTION_VERSION = 2
 ARXIV_ID = re.compile(r"(\d{4}\.\d{4,5}|[a-z][a-z0-9.-]*/\d{7})(v[1-9]\d{0,5})?", re.I | re.ASCII)
 BRACKET_REFERENCE = re.compile(r"^[ \t]*\[(\d{1,4})\][ \t]+(?=\S)", re.M)
 PAREN_REFERENCE = re.compile(r"^[ \t]*(\d{1,4})\)[ \t]+(?=\S)", re.M)
 NUMBERED_REFERENCE = re.compile(r"^[ \t]*(?:\[(\d{1,4})\]|(\d{1,4})[.)])[ \t]+(?=\S)", re.M)
 REFERENCE_SIGNAL = re.compile(r"\b(?:18|19|20)\d{2}\b|arxiv\s*:|10\.\d{4,9}/", re.I)
-SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) materials?|дополнительные материалы)(?: for\b.*)?$")
+SUPPLEMENT_HEADING = re.compile(r"(?:supplement(?:ary|al) (?:materials?|information|appendix|data)|дополнительные материалы)(?: for\b.*)?$")
 LETTERED_APPENDIX_HEADING = re.compile(r"^A\s+[A-Z][^\s,.;]*\s+[^,.;]{1,140}$")
 BIBLIOGRAPHIC_YEAR = r"(?:18|19|20)\d{2}[a-z]?"
 AUTHOR_YEAR_START = re.compile(rf"^[^\W\d_][^,\d]{{0,59}},\s+(?:[^\W\d_]\.\s*)+[^()]{{0,220}}\({BIBLIOGRAPHIC_YEAR}\)\.")
@@ -41,6 +43,7 @@ RMP_REFERENCE_START = re.compile(rf"{RMP_SURNAME}(?:{RMP_INITIALS}|[A-Z][^,.\d()
                                  rf"(?P<year>{BIBLIOGRAPHIC_YEAR}),\s*")
 RMP_TITLE = re.compile(r'[“"]([^”"]+)[”"],?\s*')
 CITATION_ANCHOR = r"[0-9]{1,6}-[0-9]{1,6}-[0-9]{1,6}"
+MATERIAL_ID = re.compile(r"(?:arxiv-[a-z0-9.-]+|pdf-[0-9a-f]{64})")
 REFERENCE_YEAR_END = re.compile(rf"\b{BIBLIOGRAPHIC_YEAR}(?:[)\]]\.?|\.)$")
 DISPLAY_YEAR = re.compile(rf"\((?P<parenthesized>{BIBLIOGRAPHIC_YEAR})\)|(?<![\w.])(?P<trailing>{BIBLIOGRAPHIC_YEAR})(?=\s*[)\]]?\.?\s*$)")
 ABSTRACT_HEADING = re.compile(r"^(?:abstract|аннотация)\s*[:.—–-]\s*(\S.*)$", re.I)
@@ -78,10 +81,14 @@ SECTION_NAMES = {
 
 
 def extraction_signature():
-    try:
-        return f"{EXTRACTION_VERSION}/pypdf/{package_version('pypdf')}"
-    except PackageNotFoundError:
-        return f"{EXTRACTION_VERSION}/pypdf/unavailable"
+    signature = [str(EXTRACTION_VERSION)]
+    for package in ("pypdf", "pypdfium2"):
+        try:
+            installed = package_version(package)
+        except PackageNotFoundError:
+            installed = "unavailable"
+        signature.extend((package, installed))
+    return "/".join(signature)
 
 
 class MaterialError(RuntimeError):
@@ -101,7 +108,15 @@ def arxiv_id(value):
     """Return the canonical base ID and any explicitly supplied version."""
     if not isinstance(value, str) or len(value) > 300:
         raise ValueError("Укажите ID или ссылку arXiv.")
-    value = re.sub(r"^arxiv:\s*", "", value.strip(), flags=re.I)
+    value = value.strip().strip("\u200b\u200e\u200f\ufeff").strip()
+    markdown = re.fullmatch(r"\[[^\]\r\n]*\]\((<?[^\s<>()[\]]+>?)\)", value)
+    if markdown:
+        value = markdown[1]
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1]
+    if re.match(r"^(?:www\.)?arxiv\.org/", value, flags=re.I):
+        value = "https://" + value
+    value = re.sub(r"^arxiv:\s*", "", value, flags=re.I)
     if "://" in value:
         try:
             url = urlsplit(value)
@@ -113,7 +128,7 @@ def arxiv_id(value):
         value = match[1].rstrip("/") if match else ""
     match = ARXIV_ID.fullmatch(re.sub(r"\.pdf$", "", value, flags=re.I))
     if not match:
-        raise ValueError("Укажите ID вида 2409.10975 или ссылку arxiv.org/abs/…")
+        raise ValueError("В поле «Статья на arXiv» вставьте ID (например, 2409.10975) или ссылку https://arxiv.org/abs/2409.10975.")
     return match[1].lower(), (match[2] or "").lower()
 
 
@@ -129,7 +144,7 @@ def web_link(value):
     return ""
 
 
-def _pdf_data(raw):
+def _pdf_data(raw, *, full=False):
     from pypdf import PdfReader
 
     reader = PdfReader(io.BytesIO(raw), strict=False)
@@ -146,43 +161,53 @@ def _pdf_data(raw):
     pages, links, notes = [], [], []
     remaining = TEXT_LIMIT
     clipped = False
-    for index in range(min(page_count, PAGE_LIMIT)):
-        page = reader.pages[index]
-        try:
-            text = clean_text(page.extract_text())
-        except Exception:
-            text = ""
-        size = min(remaining, 60_000)
-        clipped |= len(text) > size
-        pages.append(text[:size])
-        remaining -= len(pages[-1])
-        try:
-            for annotation in list(page.get("/Annots") or [])[:200]:
-                action = annotation.get_object().get("/A")
-                url = web_link(action.get_object().get("/URI")) if action else ""
-                if url and len(links) < 250:
-                    links.append({"url": url, "page": index + 1})
-        except (ValueError, TypeError, AttributeError, KeyError):
-            pass
-        if remaining <= 0:
-            break
+    with pdfium_document(raw) as spacing_pdf:
+        for index in range(page_count if full else min(page_count, PAGE_LIMIT)):
+            page = reader.pages[index]
+            try:
+                text = clean_text(page.extract_text())
+            except Exception:
+                text = ""
+            size = len(text) if full else min(remaining, 60_000)
+            clipped |= len(text) > size
+            text = restore_word_spaces(spacing_pdf, index, text[:size])
+            if full:
+                size = len(text)
+            clipped |= len(text) > size
+            pages.append(text[:size])
+            remaining -= len(pages[-1])
+            try:
+                for annotation in list(page.get("/Annots") or [])[:200]:
+                    action = annotation.get_object().get("/A")
+                    url = web_link(action.get_object().get("/URI")) if action else ""
+                    if url and len(links) < 250:
+                        links.append({"url": url, "page": index + 1})
+            except (ValueError, TypeError, AttributeError, KeyError):
+                pass
+            if not full and remaining <= 0:
+                break
     missing = sum(not page for page in pages)
     if missing:
         notes.append(f"На {missing} из {len(pages)} просмотренных страниц текст извлечь не удалось.")
     if len(pages) < page_count or clipped:
         notes.append(f"Извлечение ограничено объёмом. Просмотрено страниц: {len(pages)} из {page_count}.")
     return {"metadata": fields, "pages": pages, "page_count": page_count,
-            "partial": bool(missing or len(pages) < page_count or clipped), "notes": notes, "links": links}
+            "partial": bool(missing or len(pages) < page_count or clipped), "notes": notes, "links": links,
+            "full_extraction": full}
 
 
-def extract_pdf(raw, checkpoint):
+def extract_pdf(raw, checkpoint, *, full=False):
     """Run parsing in a child process so cancellation and the deadline can stop it."""
     checkpoint()
-    if not raw.startswith(b"%PDF-") or len(raw) > PDF_LIMIT:
+    if not raw.startswith(b"%PDF-") or not full and len(raw) > PDF_LIMIT:
         raise MaterialError("Источник не вернул PDF размером до 15 МБ.")
     env = {key: value for key, value in os.environ.items() if key.upper() != "OPENAI_API_KEY"}
+    command = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        command.append(str(Path(__file__).resolve()))
+    command.append("extract-full" if full else "extract")
     process = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "extract"], stdin=subprocess.PIPE,
+        command, stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
@@ -303,6 +328,18 @@ def split_sections(pages):
     return parts
 
 
+def main_text_pages(pages):
+    """Keep the main manuscript, including its references and inline appendices."""
+    for index, text in enumerate(pages):
+        for match in re.finditer(r"^.*$", text, re.M):
+            if SUPPLEMENT_HEADING.fullmatch(match[0].strip().casefold().rstrip(":")):
+                prefix = text[:match.start()].strip()
+                if prefix and not prefix.isdecimal():
+                    return [*pages[:index], prefix], match[0].strip()
+                return pages[:index], ""
+    return pages, ""
+
+
 def abstract_from_parts(parts):
     """Use the text between the abstract heading and the next recognized section."""
     for first, part in enumerate(parts):
@@ -333,13 +370,32 @@ def material_name(source):
     raise ValueError("Неизвестный источник материала.")
 
 
+def _material_identity(name):
+    identity = name.rsplit(" [", 1)[1][:-1] if name.endswith("]") and " [" in name else name
+    return identity if MATERIAL_ID.fullmatch(identity) else None
+
+
+def _folder_label(value, limit):
+    text = unicodedata.normalize("NFC", compact(re.sub(r'[<>:"/\\|?*]', " ", clean_text(value)))).strip(" .")
+    encoded = text.encode("utf-16-le")
+    if len(encoded) > 2 * limit:
+        text = encoded[:2 * (limit - 1)].decode("utf-16-le", errors="ignore").rstrip(" .") + "…"
+    return text
+
+
 class MaterialLibrary:
     def __init__(self, root):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        self._folders = {}
         for folder in self.root.iterdir():
-            if re.fullmatch(r"(?:arxiv-[a-z0-9.-]+|pdf-[0-9a-f]{64})", folder.name):
-                self._recover(self._direct(folder))
+            identity = _material_identity(folder.name)
+            if identity and folder.is_dir():
+                if identity in self._folders:
+                    raise MaterialError(f"Найдено несколько папок для материала {identity}.")
+                self._folders[identity] = self._direct(folder)
+                self._recover(folder)
+        self._rename_saved_folders()
 
     @staticmethod
     def _direct(path):
@@ -348,7 +404,50 @@ class MaterialLibrary:
         return path
 
     def folder(self, source):
-        return self._direct(self.root / material_name(source))
+        identity = material_name(source)
+        known = self._folders.get(identity)
+        if known and known.is_dir():
+            return self._direct(known)
+        matches = [path for path in self.root.iterdir() if _material_identity(path.name) == identity and path.is_dir()]
+        if len(matches) > 1:
+            raise MaterialError(f"Найдено несколько папок для материала {identity}.")
+        folder = self._direct(matches[0] if matches else self.root / identity)
+        if matches:
+            self._folders[identity] = folder
+        return folder
+
+    def _descriptive_folder(self, identity, article):
+        suffix = f" [{identity}]"
+        # Leave room for the temporary publication directories and managed filenames.
+        max_units = min(170, 226 - len(str(self.root).encode("utf-16-le")) // 2)
+        available = max_units - len(suffix)
+        if available < 24:
+            return self.root / identity
+        authors = article.get("authors") or []
+        first_author = _folder_label(authors[0], min(42, available // 2)) if authors else ""
+        prefix = first_author + " — " if first_author else ""
+        title = _folder_label(article.get("title"), available - len(prefix.encode("utf-16-le")) // 2)
+        return self._direct(self.root / (prefix + title + suffix)) if title else self.root / identity
+
+    def _rename_saved_folders(self):
+        for identity, folder in self._folders.items():
+            if folder.name != identity:
+                continue
+            try:
+                profile = json.loads(self._direct(folder / "profile.json").read_text(encoding="utf-8"))
+                destination = self._descriptive_folder(identity, profile["article"])
+            except (OSError, ValueError, TypeError, KeyError):
+                continue
+            if destination == folder or destination.exists():
+                continue
+            if self._direct(folder).parent != self.root or self._direct(destination).parent != self.root:
+                raise MaterialError("Папка материала находится за пределами Materials.")
+            try:
+                self._move_with_retry(folder, destination)
+            except OSError as error:
+                print(f"Material directory rename skipped for {identity}: {type(error).__name__}", file=sys.stderr, flush=True)
+            else:
+                self._folders[identity] = destination
 
     def profile(self, source):
         path = self._direct(self.folder(source) / "profile.json")
@@ -370,16 +469,17 @@ class MaterialLibrary:
             shutil.rmtree(path)
 
     @staticmethod
-    def _rename_directory(source, destination):
-        for delay in (0.05, 0.15, 0.30):
+    def _move_with_retry(source, destination, *, replace=False):
+        move = source.replace if replace else source.rename
+        for delay in (0.05, 0.15, 0.30, 0.60):
             try:
-                source.rename(destination)
+                move(destination)
                 return
             except PermissionError as error:
                 if getattr(error, "winerror", None) not in (5, 32):
                     raise
                 time.sleep(delay)
-        source.rename(destination)
+        move(destination)
 
     def _recover(self, folder):
         prepare = self._direct(folder / ".prepare")
@@ -395,17 +495,20 @@ class MaterialLibrary:
                 if old.is_file():
                     restore = self._direct(rollback / "restore")
                     shutil.copyfile(old, restore)
-                    restore.replace(target)
+                    self._move_with_retry(restore, target, replace=True)
                 else:
                     target.unlink(missing_ok=True)
-            self._rename_directory(rollback, cleanup)
+            self._move_with_retry(rollback, cleanup)
             self._discard(cleanup)
         self._discard(prepare)
 
     def publish(self, source, pdf, text, profile, manuscript=None, document=None):
         """Publish the current files or restore the previous profile after failure."""
         folder = self.folder(source)
+        if not folder.exists():
+            folder = self._descriptive_folder(material_name(source), profile["article"])
         folder.mkdir(exist_ok=True)
+        self._folders[material_name(source)] = folder
         self._recover(folder)
         previous = self.profile(source)
         old_manuscript = previous["article"].get("manuscript", {}).get("file") if previous else None
@@ -433,14 +536,14 @@ class MaterialLibrary:
                 previous = self._direct(folder / name)
                 if previous.exists():
                     shutil.copyfile(previous, old / name)
-            self._rename_directory(prepare, rollback)
+            self._move_with_retry(prepare, rollback)
             for name in MANAGED_FILES:
                 staged = rollback / "new" / name
                 if staged.is_file():
-                    staged.replace(folder / name)
+                    self._move_with_retry(staged, folder / name, replace=True)
                 elif (name == old_manuscript or name == "document.json") and (rollback / "old" / name).is_file():
                     (folder / name).unlink(missing_ok=True)
-            self._rename_directory(rollback, cleanup)
+            self._move_with_retry(rollback, cleanup)
         except OSError:
             self._recover(folder)
             raise
@@ -577,7 +680,11 @@ def _reference_item(entry):
 
 def _analog_pdf_page(analog):
     page = analog.get("page")
-    if not page or analog["source"] != "arXiv":
+    if not page:
+        return ""
+    if url := web_link(analog.get("pdf_url")):
+        return url.split("#", 1)[0] + f"#page={page}"
+    if analog["source"] != "arXiv":
         return ""
     try:
         identifier, version = arxiv_id(analog["url"])
@@ -616,7 +723,8 @@ def profile_sections(profile):
         coverage_details.append(item("Уточнение названий", profile["reference_search_note"]))
     if selection:
         budget = selection["budget_chars"]
-        scope = f'Лимит — {budget} символов.' if budget is not None else "Выбран полный текст."
+        scope = ("Выбран полный текст с иллюстрациями." if profile.get("analysis", {}).get("depth") == "vision"
+                 else f'Лимит — {budget} символов.' if budget is not None else "Выбран полный текст.")
         label = "Передано модели" if usage["calls"] else "Подготовлено для модели"
         coverage_items.append(item(label, f'{selection["selected_fragments"]} из {selection["available_fragments"]} фрагментов · '
                                    f'{selection["selected_chars"]} из {selection["available_chars"]} символов. {scope}'))
@@ -653,8 +761,8 @@ def profile_sections(profile):
         answers.append(answer)
     glossary = [item(definition["term"], "\n".join(filter(None, (definition["explanation"], definition["role"]))))
                 for definition in content.get("glossary", [])]
-    subsections = [{"key": key, "title": title, "items": items} for key, title, items in (
-        ("answers", "Ответы на вопросы", answers), ("glossary", "Словарь терминов", glossary),
+    subsections = [{"key": key, "title": title, "items": items, "math": math} for key, title, items, math in (
+        ("answers", "Ответы на вопросы", answers, "display"), ("glossary", "Словарь терминов", glossary, "inline"),
     ) if items]
     analogs = [
         {"label": analog["title"], "href": web_link(analog["url"]),
@@ -663,27 +771,33 @@ def profile_sections(profile):
                      item("Основа сравнения", analog["basis"]),
                      {**item("Подтверждающий фрагмент", f'«{analog["evidence"]}»', _analog_pdf_page(analog)),
                       "location": analog["location"]}]}
-        for analog in content["analogs"]
+        for analog in content["analogs"] if analog.get("page")
     ]
     keywords = [item(word["term"], f'{word["weight"]}% · {word["role"]}') for word in content["keywords"]]
     if article["author_keywords"]:
         keywords.append(item("Ключевые слова авторов", ", ".join(article["author_keywords"])))
-    if content["topics"]:
-        keywords.append(item("Темы", ", ".join(content["topics"])))
+    topics = content["topics"]
+    illustrations = [
+        {**item(f'Рисунок {record["number"]}'), "byline": f'Страница {record["page"]} PDF',
+         "details": [{**item("Что показано", record["description"]),
+                      "location": f'Страница {record["page"]} PDF', "page": record["page"]},
+                     item("Связь с текстом", record["connection"]), item("Результат", record["result"])]}
+        for record in content.get("illustrations", [])
+    ]
     resources = [item(resource["kind"], f'Страница {resource["page"]} · {resource["url"]}', resource["url"])
                  for resource in content["resources"]]
     references = [_reference_item(entry) for entry in content.get("references", [])]
     search = profile.get("analog_search")
     search_notes, search_items = [], []
     if search:
-        search_notes.append(f'Найдено уникальных работ: {search["records"]}. Доступен текст или аннотация: '
-                            f'{search["candidates"]}, из них с фрагментами PDF: {search["full_text"]}.')
+        search_notes.append(f'Найдено уникальных работ: {search["records"]}. Для сравнения прочитан основной текст PDF: '
+                            f'{search["full_text"]}.')
         if search["proposed"] is not None:
             search_notes.append(f'Модель предложила {search["proposed"]}, сохранено {search["accepted"]}.')
         elif search["model_error"]:
             search_notes.append(f'Сравнение не завершено. {search["model_error"]}')
         else:
-            search_notes.append("Для сравнения требуются кандидаты с доступным текстом или аннотацией.")
+            search_notes.append("Для сравнения требуется доступный полный текст кандидата.")
         if search["preserved"]:
             search_notes.append("Показаны аналоги из предыдущего поиска.")
         if "usage" in search:
@@ -705,27 +819,31 @@ def profile_sections(profile):
          "steps": profile.get("steps", {}),
          "subsections": [{"key": "coverage-details", "title": "Подробности чтения", "items": coverage_details}]},
         {"key": "overview", "title": "Краткий обзор", "paragraphs": summary or ["Обзор недоступен."],
-         "items": [], "subsections": subsections},
-        {"key": "keywords", "title": "Ключевые слова и темы", "paragraphs": [] if keywords else ["Не выделены."], "items": keywords},
-        {"key": "claims", "title": "Основные утверждения", "paragraphs": [] if claims else ["Утверждения с подтверждающими фрагментами не выделены."], "items": claims},
+         "items": [], "subsections": subsections, "math": "display"},
+        {"key": "keywords", "title": "Ключевые слова и темы", "paragraphs": [] if keywords or topics else ["Не выделены."],
+         "items": keywords, "topics": topics, "math": "inline"},
+        {"key": "claims", "title": "Основные утверждения", "paragraphs": [] if claims else ["Утверждения с подтверждающими фрагментами не выделены."], "items": claims, "math": "display"},
+        *([{"key": "illustrations", "title": "Анализ иллюстраций", "items": illustrations, "math": "display",
+            "paragraphs": [] if illustrations else ["В основном тексте рисунки не выделены."]}]
+          if "illustrations" in content else []),
         {"key": "references", "title": "Список литературы", "paragraphs": [] if references else ["Записи не выделены из доступного текста."], "items": references},
-        {"key": "analogs", "title": "Ближайшие аналоги", "paragraphs": [] if analogs else ["Достаточно обоснованных аналогов не найдено."], "items": analogs},
+        {"key": "analogs", "title": "Ближайшие аналоги", "paragraphs": [] if analogs else ["Достаточно обоснованных аналогов не найдено."], "items": analogs, "math": "display"},
         *([{"key": "search", "title": "Как искали аналоги", "paragraphs": search_notes, "items": search_items}] if search else []),
         {"key": "resources", "title": "Данные, код и приложения", "paragraphs": [] if resources else ["Ссылки в извлечённом материале не найдены."], "items": resources},
     ]
 
 
-def _markdown_text(text):
-    return re.sub(r"([\\`*_\[\]<>#|])", r"\\\1", compact(text))
+def _markdown_text(text, math=None):
+    return escape_markdown(compact(text), math)
 
 
-def _markdown_link(label, href):
-    text = _markdown_text(label)
+def _markdown_link(label, href, math=None):
+    text = _markdown_text(label, math)
     return f"[{text}](<{href}>)" if web_link(href) else text
 
 
-def _markdown_item(key, item):
-    label = _markdown_link(item["label"], item["href"])
+def _markdown_item(key, item, math=None):
+    label = _markdown_link(item["label"], item["href"], "inline" if math else None)
     if key == "references":
         number = _markdown_text(f'[{item["number"]}]') + " " if item["number"] else ""
         lines = [f"- {number}**{label}**"]
@@ -745,7 +863,7 @@ def _markdown_item(key, item):
         if item.get("byline"):
             lines.append("  " + _markdown_text(item["byline"]))
         for detail in item["details"]:
-            text = _markdown_text(detail["text"])
+            text = _markdown_text(detail["text"], "inline" if math and "location" in detail else math)
             if detail.get("location"):
                 location = _markdown_link(detail["location"], detail["href"])
                 if detail.get("page"):
@@ -754,8 +872,8 @@ def _markdown_item(key, item):
             lines.append(f'  **{detail["label"]}** · {text}')
         return lines
     parts = item["text"].splitlines()
-    return ["- **" + label + "**" + (" — " + _markdown_text(parts[0]) if parts else ""),
-            *("  " + _markdown_text(part) for part in parts[1:])]
+    return ["- **" + label + "**" + (" — " + _markdown_text(parts[0], math) if parts else ""),
+            *("  " + _markdown_text(part, math) for part in parts[1:])]
 
 
 def render_markdown(profile):
@@ -766,9 +884,11 @@ def render_markdown(profile):
     for section in profile_sections(profile):
         lines.extend(["## " + section["title"], ""])
         for paragraph in section["paragraphs"]:
-            lines.extend([_markdown_text(paragraph), ""])
+            lines.extend([_markdown_text(paragraph, section.get("math")), ""])
         for item in section["items"]:
-            lines.extend(_markdown_item(section["key"], item))
+            lines.extend(_markdown_item(section["key"], item, section.get("math")))
+        if section.get("topics"):
+            lines.extend(["", "### Темы", "", *["- " + _markdown_text(topic, "inline") for topic in section["topics"]]])
         if steps := section.get("steps"):
             labels = {"material": "Материалы", "core": "Основной профиль", "references": "Библиография",
                       "analogs": "Аналоги", "manuscript": "Исходник"}
@@ -782,28 +902,35 @@ def render_markdown(profile):
         for subsection in section.get("subsections", []):
             lines.extend(["### " + subsection["title"], ""])
             for item in subsection["items"]:
-                lines.extend(_markdown_item(subsection["key"], item))
+                lines.extend(_markdown_item(subsection["key"], item, subsection.get("math")))
             lines.append("")
-    return "\n".join(lines).rstrip() + "\n"
+    return MATH_HEADER + "\n".join(lines).rstrip() + "\n"
 
 
 def render_markdown_preview(data, snapshot):
-    source = data.decode("utf-8-sig")
+    source = data.decode("utf-8-sig").replace("\r\n", "\n")
+    legacy = not source.startswith(MATH_HEADER)
+    source = source.removeprefix(MATH_HEADER)
     try:
         from markdown_it import MarkdownIt
     except ImportError:
-        content = f"<pre>{escape(source)}</pre>"
+        query = f"?snapshot={quote(snapshot, safe='')}" if snapshot else ""
+        content = ("<h1>Форматированный просмотр недоступен</h1>"
+                   "<p>Установите зависимости в окружение сервера командой "
+                   "<code>python -m pip install -r requirements.txt</code> и перезапустите Research Agent.</p>"
+                   f'<p><a href="profile.md{query}">Скачать профиль .md</a></p>')
     else:
         parser = MarkdownIt("js-default", {"breaks": True})
+        parser.use(markdown_math, legacy=legacy)
         tokens = parser.parse(source)
         for token in tokens:
             for child in token.children or []:
                 if child.type == "link_open":
                     path, marker, fragment = child.attrGet("href").partition("#")
-                    citation = re.fullmatch(rf"page=\d+&citation=({CITATION_ANCHOR})", fragment)
+                    citation = re.fullmatch(rf"page=(\d+)&citation=({CITATION_ANCHOR})", fragment)
                     if path == "article.pdf" and citation:
-                        query = urlencode({"at": citation[1], "snapshot": snapshot})
-                        child.attrSet("href", f"citation.html?{query}#citation")
+                        query = urlencode({"snapshot": snapshot, "citation": citation[2]})
+                        child.attrSet("href", f"article.pdf?{query}#page={citation[1]}")
                         continue
                     if path == "manuscript.tex":
                         path = "manuscript.html"
@@ -818,6 +945,7 @@ def render_markdown_preview(data, snapshot):
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Профиль статьи · Research Agent {VERSION}</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/vendor/katex/katex.min.js" defer></script><script src="/math.js" defer></script>
 </head>
 <body><main class="profile-document">
   <p class="profile-document-version">Research Agent {VERSION}</p>
@@ -827,7 +955,7 @@ def render_markdown_preview(data, snapshot):
 """
 
 
-def render_citation_preview(data, anchor, snapshot):
+def citation_location(data, anchor):
     if not re.fullmatch(CITATION_ANCHOR, anchor):
         return None
     index, start, end = map(int, anchor.split("-"))
@@ -836,32 +964,18 @@ def render_citation_preview(data, anchor, snapshot):
     if index >= len(parts) or not start < end <= len(parts[index]["text"]):
         return None
     part = parts[index]
-    text = part["text"]
-    before, citation, after = escape(text[:start]), escape(text[start:end]), escape(text[end:])
-    pdf = "article.pdf" + (f"?snapshot={quote(snapshot, safe='')}" if snapshot else "") + f'#page={part["page"]}'
-    location = f'Страница {part["page"]} · {part["section"]}'
-    return f"""<!doctype html>
-<html lang="ru">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Цитата в тексте · Research Agent</title>
-  <link rel="stylesheet" href="/style.css">
-</head>
-<body><main class="profile-document">
-  <h1>{escape(location)}</h1>
-  <p><a href="{escape(pdf)}">Открыть страницу PDF</a></p>
-  <pre class="citation-text">{before}<mark id="citation">{citation}</mark>{after}</pre>
-</main></body>
-</html>
-"""
+    return part["page"], part["text"], start, end
 
 
-if __name__ == "__main__" and sys.argv[1:] == ["extract"]:
+def extract_pdf_stream(*, full):
     try:
-        result = _pdf_data(sys.stdin.buffer.read(PDF_LIMIT + 1))
+        result = _pdf_data(sys.stdin.buffer.read(-1 if full else PDF_LIMIT + 1), full=full)
     except ImportError:
         result = {"error": "Для извлечения текста установите pypdf: python -m pip install -r requirements.txt."}
     except Exception:
         result = {"error": "Не удалось прочитать структуру PDF. Проверьте файл."}
     sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+
+if __name__ == "__main__" and sys.argv[1:] in (["extract"], ["extract-full"]):
+    extract_pdf_stream(full=sys.argv[1] == "extract-full")

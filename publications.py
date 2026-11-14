@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
 from http.client import HTTPException
+from math import ceil
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -27,8 +28,10 @@ RESPONSES = "https://api.openai.com/v1/responses"
 ATOM = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
 DOI = re.compile(r"10\.\d{4,9}/[a-z0-9._;()/:+%\-]+", re.I | re.ASCII)
 READ_LIMIT = 2 * 1024 * 1024
-MAX_PROMPT_BYTES = 220_000
+MAX_PROMPT_BYTES = 500_000
+MODEL_RESPONSE_TIMEOUT = 200
 ARXIV_QUERY_INTERVAL = 3.05
+CROSSREF_QUERY_INTERVAL = 0.5
 
 
 class ServiceError(RuntimeError):
@@ -73,21 +76,26 @@ class Http:
                 result = bytearray()
                 while True:
                     self.checkpoint()
-                    chunk = response.read1(min(65_536, limit + 1 - len(result)))
+                    chunk = response.read1(65_536 if limit is None else min(65_536, limit + 1 - len(result)))
                     if not chunk:
                         return bytes(result)
                     result.extend(chunk)
-                    if len(result) > limit:
+                    if limit is not None and len(result) > limit:
                         raise ServiceError(f"{service}: ответ превышает допустимый размер.")
         except HTTPError as exc:
             error_code = ""
             if service == "OpenAI":
                 try:
                     detail = json.loads(exc.read(4096)).get("error")
-                    if isinstance(detail, dict) and detail.get("code") in {
-                            "insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
-                            "rate_limit_exceeded", "model_not_found", "invalid_api_key"}:
-                        error_code = detail["code"]
+                    if isinstance(detail, dict):
+                        code = detail.get("code")
+                        if code in {"insufficient_quota", "credit_balance_exhausted", "billing_hard_limit_reached",
+                                    "rate_limit_exceeded", "model_not_found", "invalid_api_key",
+                                    "context_length_exceeded", "input_too_large", "file_too_large"}:
+                            error_code = code
+                        elif exc.code == 400 and re.search(r"context (?:length|window)|file size|input too (?:long|large)",
+                                                           str(detail.get("message", "")), re.I):
+                            error_code = "input_too_large"
                 except (ValueError, UnicodeError, OSError, HTTPException, AttributeError):
                     pass
             exc.close()
@@ -105,7 +113,8 @@ class Http:
             raise ServiceError(f"{service}: HTTP {exc.code}.{hint}", status=exc.code, retry_after=delay, code=error_code) from None
         except (URLError, OSError, HTTPException):
             self.checkpoint()
-            raise ServiceError(f"{service}: не удалось получить ответ. Проверьте сеть и повторите вручную.") from None
+            raise ServiceError(f"{service}: не удалось получить ответ. Проверьте сеть и повторите вручную.",
+                               code="connection") from None
 
     def json(self, url, service, **kwargs):
         raw = self.read(url, service, **kwargs)
@@ -292,6 +301,8 @@ class Publications:
     def __init__(self):
         self.last_arxiv_query = None
         self.arxiv_retry_at = 0
+        self.last_crossref_query = 0
+        self.crossref_retry_at = 0
 
     def atom(self, http, **params):
         remaining = self.arxiv_retry_at - time.monotonic()
@@ -322,11 +333,18 @@ class Publications:
     def arxiv_page(self, http, base):
         return parse_arxiv_page(http.read(arxiv_url(base), "Страница arXiv", timeout=8), base)
 
-    def pdf(self, http, record):
+    def pdf(self, http, record, *, full=False):
         identifier, version = arxiv_id(record["arxiv_id"] + record["version"])
         if not version:
             raise ServiceError("arXiv: для загрузки нужна подтверждённая версия PDF.")
-        return http.read(arxiv_url(identifier, version, "pdf"), "PDF arXiv", limit=PDF_LIMIT, timeout=20)
+        return http.read(arxiv_url(identifier, version, "pdf"), "PDF arXiv",
+                         limit=None if full else PDF_LIMIT, timeout=200 if full else 20)
+
+    def candidate_pdf(self, http, record):
+        if record["arxiv_id"]:
+            return self.pdf(http, record), arxiv_url(record["arxiv_id"], record["version"], "pdf")
+        url = web_link(record.get("pdf_url"))
+        return http.read(url, "PDF публикации", limit=PDF_LIMIT, timeout=15), url
 
     def manuscript(self, http, record):
         identifier, version = record["arxiv_id"], record["version"]
@@ -339,7 +357,7 @@ class Publications:
         return self.atom(http, search_query=query, max_results=8, sortBy="relevance")
 
     def crossref_search(self, http, terms):
-        fields = "type,resource,container-title,volume,issue,page,article-number"
+        fields = "type,resource,link,container-title,volume,issue,page,article-number"
         return [work for entry in self._crossref_items(http, " ".join(terms), 8, fields)
                 if isinstance(entry, dict) and entry.get("type") in
                 {"journal-article", "proceedings-article", "posted-content", "book-chapter"}
@@ -348,7 +366,7 @@ class Publications:
     def _crossref_items(self, http, text, rows, fields):
         params = {"query.bibliographic": text, "rows": rows,
                   "select": "DOI,title,author,published,abstract," + fields}
-        payload = http.json(CROSSREF + "?" + urlencode(params), "Поиск Crossref", timeout=8)
+        payload = self._crossref_json(http, CROSSREF + "?" + urlencode(params), "Поиск Crossref", 8)
         message = payload.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("items"), list):
             raise ServiceError("Crossref: неожиданный формат результатов поиска.")
@@ -361,10 +379,31 @@ class Publications:
                    if (work := crossref_record(entry)) and _matches_citation(text, entry, work)}
         return next(iter(matches.values())) if len(matches) == 1 else None
 
-    def crossref_reference(self, http, identifier):
-        payload = http.json(CROSSREF + "/" + quote(identifier, safe=""), "Ссылка Crossref", timeout=6)
-        work = crossref_record(payload.get("message"))
-        return work if work and work["doi"] == identifier else None
+    def crossref_reference(self, http, identifier, *, citation=None):
+        payload = self._crossref_json(http, CROSSREF + "/" + quote(identifier, safe=""), "Ссылка Crossref", 6)
+        entry = payload.get("message")
+        work = crossref_record(entry)
+        if work and work["doi"] == identifier and (citation is None or _matches_citation(" " + _citation_words(citation) + " ", entry, work)):
+            return work
+        return None
+
+    def _crossref_json(self, http, url, label, timeout):
+        remaining = self.crossref_retry_at - time.monotonic()
+        if remaining > 0:
+            raise ServiceError(f"Crossref временно ограничил запросы. Повторите уточнение через {ceil(remaining)} с.",
+                               status=429, retry_after=remaining, deferred=True)
+        while self.last_crossref_query and (delay := self.last_crossref_query + CROSSREF_QUERY_INTERVAL - time.monotonic()) > 0:
+            time.sleep(min(delay, .15, http.checkpoint()))
+        self.last_crossref_query = time.monotonic()
+        try:
+            return http.json(url, label, timeout=timeout)
+        except ServiceError as error:
+            if error.status != 429:
+                raise
+            delay = 60 if error.retry_after is None else max(1, error.retry_after)
+            self.crossref_retry_at = time.monotonic() + delay
+            raise ServiceError(f"Crossref временно ограничил запросы. Повторите уточнение через {ceil(delay)} с.",
+                               status=429, retry_after=delay) from None
 
 
 def object_schema(**properties):
@@ -393,6 +432,8 @@ PROFILE_SCHEMA = object_schema(
     reference_hints=array(object_schema(reference_id=STRING, title=STRING, evidence=STRING, search_query=STRING)),
 )
 REFERENCE_SCHEMA = object_schema(reference_hints=PROFILE_SCHEMA["properties"]["reference_hints"])
+REFERENCE_REVIEW_SCHEMA = object_schema(reference_hints=array(object_schema(
+    reference_id=STRING, title=STRING, evidence=STRING, search_query=STRING, doi=STRING, arxiv_id=STRING)))
 ANALOG_SCHEMA = object_schema(
     analogs=array(object_schema(candidate_id=STRING, similarity=STRING, difference=STRING,
                                  snippet=STRING)),
@@ -407,30 +448,37 @@ class Model:
         self.start_call = start_call
         self.record_usage = record_usage
 
-    def ask(self, name, schema, instructions, inputs):
+    def ask(self, name, schema, instructions, inputs, *, attachments=(), visual=False):
         if not self.key:
             raise ServiceError("Для подготовки профиля задайте переменную OPENAI_API_KEY и перезапустите сервер.")
+        serialized = json.dumps(inputs, ensure_ascii=False)
         payload = {
             "model": self.settings["model"], "store": False,
-            "instructions": instructions, "input": json.dumps(inputs, ensure_ascii=False),
-            "max_output_tokens": self.settings["max_output_tokens"],
+            "instructions": instructions, "input": serialized,
             "text": {"format": {"type": "json_schema", "name": name, "strict": True, "schema": schema}},
         }
+        if not visual:
+            payload["max_output_tokens"] = self.settings["max_output_tokens"]
+        if attachments:
+            payload["input"] = [{"role": "user", "content": [{"type": "input_text", "text": serialized}, *attachments]}]
         effort = self.settings.get("reasoning_effort", "auto")
         validate_effort(payload["model"], effort)
         if effort != "auto":
             payload["reasoning"] = {"effort": effort}
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        if len(raw) > MAX_PROMPT_BYTES:
+        if not visual and len(raw) > MAX_PROMPT_BYTES:
             raise ServiceError("Запрос к модели слишком велик. Выберите меньший охват текста и запустите разбор заново.")
         self.http.checkpoint()
         self.start_call()
-        response = self.http.json(RESPONSES, "OpenAI", data=raw, timeout=75,
+        response = self.http.json(RESPONSES, "OpenAI", data=raw,
+                                  timeout=self.settings["time_limit_seconds"] if visual else MODEL_RESPONSE_TIMEOUT,
+                                  **({"limit": None} if visual else {}),
                                   headers={"Content-Type": "application/json", "Authorization": "Bearer " + self.key})
         self.record_usage(response.get("usage"))
         if response.get("status") != "completed":
             if (response.get("incomplete_details") or {}).get("reason") == "max_output_tokens":
-                raise ServiceError("Ответ модели достиг лимита выходных токенов. Можно изменить лимит и запустить заново.")
+                raise ServiceError("Ответ модели достиг лимита выходных токенов. Можно изменить лимит и запустить заново.",
+                                   code="max_output_tokens")
             raise ServiceError("Модель не завершила ответ.")
         pieces = []
         for output in response.get("output", []):

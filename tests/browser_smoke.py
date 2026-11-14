@@ -3,6 +3,7 @@
 Install requirements-dev.txt and run `python -m playwright install chromium` first.
 """
 import argparse
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from playwright.sync_api import expect, sync_playwright
-from test_research import ABSTRACT, FOCAL, QUOTE, ResearchTest, pdf_bytes
+from test_research import ABSTRACT, FOCAL, QUOTE, ResearchTest, illustrated_pdf, pdf_bytes
 
 
 def check_layout(page, label):
@@ -20,7 +21,7 @@ def check_layout(page, label):
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth"), f"{label}: horizontal overflow {overflow}"
 
 
-def check_design(page, fixture, paper_id, screenshots):
+def check_design(page, fixture, paper_id, screenshots, engine):
     screenshots.mkdir(parents=True, exist_ok=True)
     page.set_viewport_size({"width": 1440, "height": 1000})
     page.goto(fixture.url + "#jobs")
@@ -100,21 +101,42 @@ def check_design(page, fixture, paper_id, screenshots):
 
     page.set_viewport_size({"width": 1440, "height": 1000})
     for name, selector in (
-        ("document", '#paper-profile a[href*="profile.html"]'),
+        ("document", '#paper-profile a:has-text("Просмотреть профиль")'),
         ("manuscript", '#paper-profile a[href*="manuscript.html"]'),
         ("citation", '.reference-mention'),
     ):
         if name == "citation":
+            references = page.locator('[data-section="references"]')
+            if not references.evaluate("node => node.open"):
+                references.locator(":scope > summary").click()
             citations = page.locator(".reference-citations").first
             if not citations.evaluate("node => node.open"):
                 citations.locator("summary").click()
+            citation_link = page.locator(selector).first
+            href = citation_link.get_attribute("href")
+            assert "/article.pdf?" in href and "citation=" in href and "#page=1" in href
+            response = page.request.get(href.split("#", 1)[0])
+            assert response.ok and response.headers["content-type"] == "application/pdf"
+            assert b"/Highlight" in response.body()
+            if engine == "firefox":
+                # Headless Firefox downloads this PDF, so verify the browser-facing link and response.
+                expect(citation_link).to_have_attribute("target", "_blank")
+                continue
         with page.expect_popup() as opened:
             page.locator(selector).first.click()
         document = opened.value
         document.wait_for_load_state()
-        expect(document.locator(".profile-document")).to_be_visible()
         if name == "citation":
-            expect(document.locator("mark#citation")).to_be_visible()
+            expect(document).to_have_url(href)
+            assert document.evaluate("document.contentType") == "application/pdf"
+            document.close()
+            continue
+        expect(document.locator(".profile-document")).to_be_visible()
+        if name == "document":
+            expect(document).to_have_url(re.compile(r"/profile\.html\?snapshot="))
+            expect(document.locator(".profile-document h1")).to_contain_text("Fixture focal article")
+            expect(document.locator(".formula-display mfrac")).to_be_visible()
+            expect(document.locator(".formula-inline msub").first).to_be_visible()
         for width in (1440, 390):
             document.set_viewport_size({"width": width, "height": 1000 if width == 1440 else 844})
             document.evaluate("document.fonts.ready")
@@ -123,12 +145,12 @@ def check_design(page, fixture, paper_id, screenshots):
         document.close()
 
 
-def run(channel=None, screenshots=None):
+def run(channel=None, screenshots=None, engine="chromium"):
     fixture = ResearchTest("test_uploaded_pdf_extraction_sources_and_matching_markdown")
     fixture.setUp()
     try:
         with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(channel=channel)
+            browser = getattr(playwright, engine).launch(channel=channel)
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
             errors = []
             page.on("pageerror", lambda error: errors.append(str(error)))
@@ -175,8 +197,32 @@ def run(channel=None, screenshots=None):
             assert fixture.call("/api/settings")["model"] == "gpt-6-luna"
             expect(page.locator("#job-detail .result-state")).to_contain_text("Основной профиль готов")
             expect(page.locator("#job-detail")).to_contain_text("Расчётная стоимость")
+            page.evaluate("id => localStorage.setItem('research-agent:profile-sections:' + id, JSON.stringify({overview: false, references: true}))", first["paper_id"])
             page.locator('#job-detail a[href^="#paper/"]').click()
             expect(page.locator("#paper-profile h1")).to_contain_text("Fixture focal article")
+            expect(page.locator("#paper-profile details[open]")).to_have_count(1)
+            expect(page.locator('[data-section="overview"]')).to_have_attribute("open", "")
+            overview = page.locator('[data-section="overview"]')
+            expect(overview.locator(".formula-inline math").first).to_be_visible()
+            expect(overview.locator(".formula-display mfrac")).to_be_visible()
+            expect(overview).to_contain_text(r"$\unknownFixture{x}$")
+            glossary = page.locator('[data-section="glossary"]')
+            glossary.locator(":scope > summary").click()
+            expect(glossary.locator(".formula-inline msub")).to_be_visible()
+            expect(glossary.locator(".formula-display")).to_have_count(0)
+            glossary.locator(":scope > summary").click()
+            keywords = page.locator('[data-section="keywords"]')
+            keywords.locator(":scope > summary").click()
+            expect(keywords.locator(".formula-inline msub")).to_be_visible()
+            expect(keywords.locator(".profile-topics h3")).to_have_text("Темы")
+            assert keywords.locator(".profile-topics").bounding_box()["width"] >= keywords.locator(".profile-items").bounding_box()["width"] - 1
+            keywords.locator(":scope > summary").click()
+            assert page.evaluate(r"""() => {
+                const node = document.createElement('div');
+                node.textContent = String.raw`$\href{javascript:alert(1)}{x}\includegraphics{https://example.org/x.png}$`;
+                window.renderProfileMath(node);
+                return !node.querySelector('a, img, [href], [src]');
+            }""")
             coverage = page.locator('[data-section="coverage"]')
             coverage.locator(":scope > summary").click()
             expect(coverage.locator(".step-list li")).to_have_count(5)
@@ -187,6 +233,7 @@ def run(channel=None, screenshots=None):
             page.locator('[data-section="answers"] > summary').click()
             page.locator('[data-section="answers"] .profile-entry-summary').first.click()
             expect(page.locator('[data-section="answers"]')).to_contain_text(QUOTE)
+            expect(page.locator('[data-section="answers"] .formula-inline math')).to_be_visible()
             page.get_by_role("button", name="Разобрать заново", exact=True).click()
             expect(page.locator("#analysis-dialog")).to_be_visible()
             expect(page.locator("#analysis-depth")).to_have_value("full")
@@ -214,7 +261,33 @@ def run(channel=None, screenshots=None):
             page.locator('nav a[data-page="new"]').click()
             expect(page.locator("#new-model")).to_have_value("gpt-6-luna")
             expect(page.locator("#new-effort")).to_have_value("medium")
-            check_design(page, fixture, first["paper_id"], screenshots or Path(tempfile.gettempdir()) / "research-agent-design")
+            check_design(page, fixture, first["paper_id"], screenshots or Path(tempfile.gettempdir()) / "research-agent-design", engine)
+            page.goto(fixture.url + "#new")
+            page.locator("#depth").select_option("vision")
+            expect(page.locator("#vision-note")).to_be_visible()
+            expect(page.locator("#bibliography-review")).not_to_be_checked()
+            visual = fixture.uploaded(illustrated_pdf(), depth="vision")
+            assert fixture.settled(visual)["status"] == "completed"
+            page.goto(fixture.url + "#paper/" + visual["paper_id"])
+            figures = page.locator('[data-section="illustrations"]')
+            figures.locator(":scope > summary").click()
+            expect(figures.locator(".profile-entry")).to_have_count(2)
+            figures.locator(".profile-entry-summary").last.click()
+            expect(figures.get_by_role("link", name="Страница 2 PDF")).to_have_attribute("href", re.compile(r"#page=2$"))
+            expect(figures.locator(".profile-entry-facts").last).to_contain_text("Разница 4 дБ.")
+            page.goto(fixture.url + "#jobs")
+            card = page.locator(f'.job-item[data-job-id="{visual["id"]}"]')
+            row = page.locator(".job-list-row").filter(has=card)
+            trash = row.get_by_role("button", name="Удалить задание")
+            expect(trash.locator("svg")).to_be_visible()
+            card_box, trash_box = card.bounding_box(), trash.bounding_box()
+            assert 0 <= card_box["x"] + card_box["width"] - trash_box["x"] - trash_box["width"] < 24
+            assert 0 <= card_box["y"] + card_box["height"] - trash_box["y"] - trash_box["height"] < 16
+            page.once("dialog", lambda dialog: dialog.accept())
+            trash.click()
+            expect(row).to_have_count(0)
+            page.goto(fixture.url + "#paper/" + visual["paper_id"])
+            expect(page.locator("#paper-profile h1")).to_contain_text("Illustrated article")
             assert not errors, errors
             browser.close()
         print("Browser checks passed: models, keyboard, settings, analysis, reanalysis, continuation; all pages at 1440/768/390/320px; menus, disclosures, fonts, Markdown, TeX and citations.")
@@ -225,6 +298,7 @@ def run(channel=None, screenshots=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--channel", help="Installed browser channel, e.g. msedge; defaults to Playwright Chromium")
+    parser.add_argument("--engine", choices=("chromium", "firefox"), default="chromium")
     parser.add_argument("--screenshots", type=Path, help="Directory for design review screenshots")
     args = parser.parse_args()
-    run(args.channel, args.screenshots)
+    run(args.channel, args.screenshots, args.engine)

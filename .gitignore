@@ -8,3 +8,6 @@ __pycache__/
 .env
 .env.*
 !.env.example
+/ResearchAgent.exe
+/research-agent-image.tar.gz
+/runtime/

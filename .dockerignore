@@ -1,0 +1,6 @@
+**
+!*.py
+!Dockerfile
+!requirements.txt
+!static/
+!static/**
