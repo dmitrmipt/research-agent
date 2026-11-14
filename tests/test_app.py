@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from pathlib import Path
 import shutil
 import signal
@@ -27,8 +28,10 @@ class AppTest(unittest.TestCase):
         self.url = f'http://127.0.0.1:{self.port}'
         self.start()
 
-    def start(self):
-        self.process = subprocess.Popen([sys.executable, str(ROOT / 'app.py'), '--port', str(self.port), '--data-dir', str(self.temp)], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    def start(self, *args, env=None):
+        self.process = subprocess.Popen([sys.executable, str(ROOT / 'app.py'), '--port', str(self.port),
+                                         '--data-dir', str(self.temp), *args], stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE, env=env)
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
             if self.process.poll() is not None:
@@ -115,6 +118,15 @@ class AppTest(unittest.TestCase):
         time.sleep(.3)
         self.assertFalse(any(j['status'] in ('queued', 'running') for j in self.call('/api/jobs')))
 
+    def test_container_bind_materials_and_health_identity(self):
+        self.kill()
+        materials = self.temp / 'mounted-materials'
+        self.start('--bind', '0.0.0.0', '--materials-dir', str(materials),
+                   env={**os.environ, 'RESEARCH_AGENT_INSTANCE': 'fixture-container'})
+        self.assertEqual(self.call('/api/health')['instance'], 'fixture-container')
+        self.assertTrue(materials.is_dir())
+        self.assertTrue((self.temp / 'research.sqlite3').is_file())
+
     @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux TCP port reuse')
     def test_restart_on_same_port_after_ctrl_c(self):
         with socket.create_connection(('127.0.0.1', self.port), timeout=5) as client:
@@ -160,6 +172,20 @@ class AppTest(unittest.TestCase):
         with urlopen(self.url) as response:
             self.assertIn('Новый разбор', response.read().decode())
             self.assertIn("frame-ancestors 'none'", response.headers['Content-Security-Policy'])
+
+    def test_arxiv_source_accepts_copied_links_in_visual_mode(self):
+        url = 'https://arxiv.org/abs/2609.12928'
+        for source in (url, f'[{url}]({url})', f'[Статья](<{url}>)', f'<{url}>',
+                       'arxiv.org/abs/2609.12928', '\u200b' + url + '\ufeff', '2609.12928'):
+            with self.subTest(source=source):
+                job = self.create(source=source, depth='vision')
+                self.assertEqual(job['input_source'], 'arxiv:2609.12928')
+                self.assertEqual(job['depth'], 'vision')
+                self.call('/api/jobs/' + job['id'] + '/cancel', {})
+        self.assertEqual(len(self.call('/api/papers')), 1)
+        with self.assertRaises(HTTPError) as error:
+            self.create(source=f'[{url}](https://example.com/abs/2609.12928)', depth='vision')
+        self.assertEqual(error.exception.code, 400)
 
     def test_local_fonts_are_served_without_exposing_other_files(self):
         for name, mime, signature in (

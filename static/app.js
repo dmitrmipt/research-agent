@@ -12,6 +12,7 @@ let jobs = [], detailKey = "", jobListKey = "", paperListKey = "", busy = false,
 let profileId = null, profileKey = "", demoSeconds = 3, health = null;
 let libraryShortcutsKey = "";
 const profileDisclosures = new Map();
+let currentProfileDisclosures = {};
 const el = (tag, text, cls) => {const node=document.createElement(tag); if(text!==undefined) node.textContent=text; if(cls) node.className=cls; return node;};
 const date = value => new Date(value).toLocaleString("ru-RU", {day:"2-digit",month:"short",hour:"2-digit",minute:"2-digit"});
 function notify(message, error=false){$("notice").textContent=message;$("notice").className=error?"error":"";$("notice").hidden=false;clearTimeout(noticeTimer);noticeTimer=setTimeout(()=>$("notice").hidden=true,error?12000:5000);}
@@ -32,6 +33,7 @@ function navigate(){
   if(!["new","jobs","library","settings","paper"].includes(currentPage) || (currentPage==="paper" && !match)) currentPage="new";
   if (profileId !== (match?.[1] ?? null)) {
     profileId = match?.[1] ?? null;
+    currentProfileDisclosures = {};
     profileKey = "";
     $("paper-profile").replaceChildren(el("p", "Загрузка профиля…", "hint"));
   }
@@ -116,7 +118,8 @@ function renderJobs(){
   if(filtered.length&&!filtered.some(job=>job.id===selectedJob)){selectedJob=filtered[0].id;detailKey="";}
   const key=JSON.stringify([selectedJob,filtered.map(job=>[job.id,job.title,job.status,job.result_status])]);
   if(key===jobListKey)return;jobListKey=key;
-  const list=$("job-list"), focusedId=list.contains(document.activeElement)?document.activeElement.dataset.jobId:null;
+  const list=$("job-list"), focusedButton=list.contains(document.activeElement)?document.activeElement:null;
+  const focusedId=focusedButton?.dataset.jobId;
   list.replaceChildren();
   if(!filtered.length){list.append(empty("Пока нет заданий","Начните с нового разбора статьи."));return;}
   for(const job of filtered){
@@ -127,8 +130,12 @@ function renderJobs(){
     button.addEventListener("click",()=>{selectedJob=job.id;detailKey="";renderJobs();refresh();});
     row.append(button);
     if (!["running", "queued"].includes(job.status)) {
-      const remove = el("button", "Удалить задание", "job-delete");
+      const remove = el("button", undefined, "job-delete");
       remove.type = "button";
+      remove.dataset.jobId = job.id;
+      remove.setAttribute("aria-label", "Удалить задание");
+      remove.title = "Удалить задание";
+      remove.innerHTML = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v5m4-5v5"/></svg>`;
       remove.onclick = async () => {
         if (!window.confirm(`Удалить задание «${job.title}» из истории? Профиль статьи сохранится.`)) return;
         remove.disabled = true;
@@ -142,7 +149,10 @@ function renderJobs(){
       row.append(remove);
     }
     list.append(row);
-    if(focusedId===job.id)button.focus({preventScroll:true});
+    if (focusedId === job.id) {
+      const replacement = focusedButton.classList.contains("job-delete") ? row.querySelector(".job-delete") : button;
+      (replacement || button).focus({preventScroll: true});
+    }
   }
 }
 function link(label, href, className, external = false) {
@@ -334,20 +344,23 @@ document.querySelector(".skip-link").addEventListener("click", event => {
 
 function profileDetails(id, key, className, initiallyOpen = false) {
   const storageKey = "research-agent:profile-sections:" + id;
-  if (!profileDisclosures.has(id)) {
+  const library = key === "library-abstract";
+  if (library && !profileDisclosures.has(id)) {
     let saved;
     try { saved = JSON.parse(localStorage.getItem(storageKey)); }
     catch { /* The page can still remember disclosures in memory. */ }
     profileDisclosures.set(id, saved && typeof saved === "object" && !Array.isArray(saved) ? saved : {});
   }
-  const state = profileDisclosures.get(id);
+  const state = library ? profileDisclosures.get(id) : currentProfileDisclosures;
   const details = el("details", undefined, className);
   details.open = typeof state[key] === "boolean" ? state[key] : initiallyOpen;
   details.addEventListener("toggle", () => {
     if (!details.isConnected) return;
     state[key] = details.open;
-    try { localStorage.setItem(storageKey, JSON.stringify(state)); }
-    catch { /* Keep the state in memory when storage is unavailable. */ }
+    if (library) {
+      try { localStorage.setItem(storageKey, JSON.stringify(state)); }
+      catch { /* Keep the state in memory when storage is unavailable. */ }
+    }
   });
   return details;
 }

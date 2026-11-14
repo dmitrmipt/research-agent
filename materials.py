@@ -108,7 +108,15 @@ def arxiv_id(value):
     """Return the canonical base ID and any explicitly supplied version."""
     if not isinstance(value, str) or len(value) > 300:
         raise ValueError("Укажите ID или ссылку arXiv.")
-    value = re.sub(r"^arxiv:\s*", "", value.strip(), flags=re.I)
+    value = value.strip().strip("\u200b\u200e\u200f\ufeff").strip()
+    markdown = re.fullmatch(r"\[[^\]\r\n]*\]\((<?[^\s<>()[\]]+>?)\)", value)
+    if markdown:
+        value = markdown[1]
+    if value.startswith("<") and value.endswith(">"):
+        value = value[1:-1]
+    if re.match(r"^(?:www\.)?arxiv\.org/", value, flags=re.I):
+        value = "https://" + value
+    value = re.sub(r"^arxiv:\s*", "", value, flags=re.I)
     if "://" in value:
         try:
             url = urlsplit(value)
@@ -120,7 +128,7 @@ def arxiv_id(value):
         value = match[1].rstrip("/") if match else ""
     match = ARXIV_ID.fullmatch(re.sub(r"\.pdf$", "", value, flags=re.I))
     if not match:
-        raise ValueError("Укажите ID вида 2409.10975 или ссылку arxiv.org/abs/…")
+        raise ValueError("В поле «Статья на arXiv» вставьте ID (например, 2409.10975) или ссылку https://arxiv.org/abs/2409.10975.")
     return match[1].lower(), (match[2] or "").lower()
 
 

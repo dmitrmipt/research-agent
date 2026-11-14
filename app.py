@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.util import find_spec
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from manuscripts import render_tex_preview
@@ -565,7 +565,11 @@ class Store:
                                          if continuation and continuation["retry"]["allowed"] else None)
             paper["profile"] = profile
             paper["sections"] = profile_sections(profile) if profile else []
-            paper["directory"] = str(self.materials.folder(paper["source"])) if profile else ""
+            paper["directory"] = ""
+            if profile:
+                folder = self.materials.folder(paper["source"])
+                windows_materials = os.environ.get("RESEARCH_AGENT_HOST_MATERIALS")
+                paper["directory"] = str(PureWindowsPath(windows_materials) / folder.name if windows_materials else folder)
             return paper
 
     def paper_file(self, paper_id, filename, snapshot):
@@ -819,6 +823,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.respond(200, (ROOT / "static" / name).read_bytes(), mime)
         if path == "/api/health":
             return self.respond(200, {"app": "research-agent", "version": VERSION, "mode": "research",
+                                      "instance": os.environ.get("RESEARCH_AGENT_INSTANCE", ""),
                                       "api_configured": bool(self.server.worker.api_key),
                                       "pdf_configured": find_spec("pypdf") is not None,
                                       "worker_alive": self.server.worker.thread.is_alive()})
@@ -936,16 +941,20 @@ class LocalServer(ThreadingHTTPServer):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--bind", choices=("127.0.0.1", "0.0.0.0"), default="127.0.0.1")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
+    parser.add_argument("--materials-dir", type=Path)
     args = parser.parse_args()
     # Bind before recovery: a second instance must not interrupt the first one's jobs.
     try:
-        server = LocalServer(("127.0.0.1", args.port), Handler)
+        server = LocalServer((args.bind, args.port), Handler)
     except OSError:
         raise SystemExit(f"Port {args.port} is unavailable. Is Research Agent already running?")
     try:
         with exclusive_data(args.data_dir):
-            materials_dir = ROOT / "Materials" if args.data_dir.resolve() == ROOT / "data" else args.data_dir / "Materials"
+            materials_dir = args.materials_dir
+            if materials_dir is None:
+                materials_dir = ROOT / "Materials" if args.data_dir.resolve() == ROOT / "data" else args.data_dir / "Materials"
             serve(server, args.data_dir, materials_dir)
     except AlreadyRunning as error:
         server.server_close()

@@ -1,0 +1,22 @@
+name: research-agent
+services:
+  research-agent:
+    image: research-agent:local
+    build: .
+    init: true
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      - OPENAI_API_KEY
+      - RESEARCH_AGENT_INSTANCE=${RESEARCH_AGENT_INSTANCE:-research-agent-compose}
+      - RESEARCH_AGENT_HOST_MATERIALS
+    volumes:
+      - ./data:/app/data
+      - ./Materials:/app/Materials
+    stop_signal: SIGINT
+    stop_grace_period: 45s
+    healthcheck:
+      test: ["CMD", "python", "-c", "import json, urllib.request as u; assert json.load(u.urlopen('http://127.0.0.1:8765/api/health', timeout=2))['worker_alive']"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
