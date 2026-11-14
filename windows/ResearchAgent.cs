@@ -42,6 +42,8 @@ internal static class Program
 
 internal sealed class AgentTray : ApplicationContext
 {
+    private enum ServerMode { None, Local, Container, Other }
+
     private const string Address = "http://127.0.0.1:8765/";
     private readonly string root;
     private readonly string project;
@@ -49,13 +51,18 @@ internal sealed class AgentTray : ApplicationContext
     private readonly string dockerDesktop;
     private readonly NotifyIcon tray;
     private readonly ContextMenuStrip menu;
-    private readonly ToolStripMenuItem status, start, stop, open, exit;
+    private readonly ToolStripMenuItem status, start, stop, open, restartContainer, restartLocal, errorDetails, exit;
     private readonly System.Windows.Forms.Timer timer;
     private readonly Icon gray = StatusIcon(Color.FromArgb(138, 146, 151));
     private readonly Icon yellow = StatusIcon(Color.FromArgb(252, 193, 72));
     private readonly Icon green = StatusIcon(Color.FromArgb(78, 218, 142));
     private readonly Icon red = StatusIcon(Color.FromArgb(243, 126, 91));
-    private bool busy, checking, managed, healthy;
+    private bool busy, checking;
+    private int operation;
+    private ServerMode mode, preferred = ServerMode.Local;
+    private Process localProcess;
+    private Task<string> localErrors;
+    private string lastError;
 
     public AgentTray(string root, string project)
     {
@@ -72,12 +79,17 @@ internal sealed class AgentTray : ApplicationContext
         menu = new ContextMenuStrip();
         status = new ToolStripMenuItem { Enabled = false };
         open = new ToolStripMenuItem("Открыть Research Agent", null, (s, e) => Open(Address));
-        start = new ToolStripMenuItem("Запустить сервер", null, async (s, e) => await StartServer());
-        stop = new ToolStripMenuItem("Остановить сервер", null, async (s, e) => await StopServer());
-        exit = new ToolStripMenuItem("Закрыть значок", null, (s, e) => ExitThread());
+        start = new ToolStripMenuItem("Запустить сервер", null, async (s, e) => await StartServer(preferred));
+        stop = new ToolStripMenuItem("Остановить сервер", null, async (s, e) => await StopServer(false));
+        restartContainer = new ToolStripMenuItem("Перезапустить в контейнере", null, async (s, e) => await StartServer(ServerMode.Container));
+        restartLocal = new ToolStripMenuItem("Перезапустить локально", null, async (s, e) => await StartServer(ServerMode.Local));
+        errorDetails = new ToolStripMenuItem("Сведения об ошибке", null,
+            (s, e) => MessageBox.Show(lastError, "Research Agent", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+        errorDetails.Visible = false;
+        exit = new ToolStripMenuItem("Выйти", null, async (s, e) => await StopServer(true));
         menu.Items.AddRange(new ToolStripItem[] { status, new ToolStripSeparator(), open, start, stop,
-            new ToolStripMenuItem("Открыть папку Materials", null, (s, e) => OpenMaterials()),
-            new ToolStripSeparator(), exit });
+            restartContainer, restartLocal, new ToolStripMenuItem("Открыть папку Materials", null, (s, e) => OpenMaterials()),
+            errorDetails, new ToolStripSeparator(), exit });
         tray = new NotifyIcon { ContextMenuStrip = menu, Icon = gray, Text = "Research Agent", Visible = true };
         tray.DoubleClick += (s, e) => { if (open.Enabled) Open(Address); };
         ShowStatus("Остановлен", gray, false);
@@ -90,88 +102,188 @@ internal sealed class AgentTray : ApplicationContext
     private async void StartOnIdle(object sender, EventArgs args)
     {
         Application.Idle -= StartOnIdle;
-        await StartServer();
+        await StartServer(ServerMode.Local, reuseRunning: true);
     }
 
     private async void CheckServer(object sender, EventArgs args)
     {
         if (busy || checking) return;
         checking = true;
+        int version = operation;
         try
         {
             string instance = await Task.Run(() => RunningInstance());
-            if (busy || !tray.Visible) return;
+            if (busy || version != operation || !tray.Visible) return;
             if (instance != null)
             {
-                managed = instance == project;
-                ShowStatus(managed ? "Сервер работает" : "Запущен другой экземпляр", green, true);
+                ShowRunning(ModeOf(instance));
             }
-            else if (managed || healthy)
+            else if (mode != ServerMode.None)
+            {
+                if (mode == ServerMode.Other || mode == ServerMode.Local && !LocalRunning())
+                    mode = ServerMode.None;
                 ShowStatus("Сервер недоступен", red, false);
+            }
         }
         finally { checking = false; }
     }
 
-    private async Task StartServer()
+    private ServerMode ModeOf(string instance)
+    {
+        if (instance == project + "-local") return ServerMode.Local;
+        if (instance == project) return ServerMode.Container;
+        return instance == null ? ServerMode.None : ServerMode.Other;
+    }
+
+    private void ShowRunning(ServerMode running)
+    {
+        mode = running;
+        if (running == ServerMode.Other)
+            ShowStatus("Запущен другой экземпляр", green, true);
+        else
+        {
+            preferred = running;
+            ShowStatus(running == ServerMode.Local ? "Сервер работает локально" : "Сервер работает в контейнере", green, true);
+        }
+    }
+
+    private async Task StartServer(ServerMode target, bool reuseRunning = false)
     {
         if (busy) return;
+        operation++;
+        errorDetails.Available = false;
         busy = true;
         ShowStatus("Проверка сервера", yellow, false);
+        ServerMode previous = ServerMode.None;
+        bool starting = false;
+        string message;
         try
         {
-            string instance = await Task.Run(() => RunningInstance());
-            if (instance == project)
+            var running = ModeOf(await Task.Run(() => RunningInstance()));
+            if (running != ServerMode.None) mode = running;
+            if (running != ServerMode.None && (reuseRunning || running == target))
             {
-                managed = true;
                 busy = false;
-                ShowStatus("Сервер работает", green, true);
+                ShowRunning(running);
                 Open(Address);
                 return;
             }
-            if (instance != null && instance != project)
-                throw new InvalidOperationException("На порту 8765 уже работает другой Research Agent. Остановите его перед запуском контейнера.");
-            if (!File.Exists(Path.Combine(root, "compose.yaml")))
-                throw new InvalidOperationException("Положите ResearchAgent.exe в папку проекта рядом с compose.yaml.");
-            if (instance == null && await Task.Run(() => PortInUse()) && !await Task.Run(() => ContainerRunning()))
-                throw new InvalidOperationException("Порт 8765 занят. Освободите его и повторите запуск из меню значка.");
-            ShowStatus("Запуск Docker", yellow, false);
-            await Task.Run(() => EnsureDocker());
-            ShowStatus("Подготовка и запуск сервера", yellow, false);
-            await Task.Run(() => {
-                if (File.Exists(Path.Combine(root, "research-agent-image.tar.gz")))
-                {
-                    RunDocker("image load --input research-agent-image.tar.gz", 300, true);
-                    RunDocker(Compose("up -d --no-build --pull never"), 90, true);
-                }
-                else RunDocker(Compose("up -d --build"), 900, true);
-            });
-            managed = true;
-            for (int attempt = 0; attempt < 24; attempt++)
+            if (running == ServerMode.Other || running == ServerMode.None && mode == ServerMode.None &&
+                await Task.Run(() => PortInUse()))
+                throw new InvalidOperationException("Порт 8765 занят другим приложением. Остановите его перед запуском Research Agent.");
+
+            if (target == ServerMode.Container)
             {
-                if (await Task.Run(() => RunningInstance()) == project)
-                {
-                    busy = false;
-                    ShowStatus("Сервер работает", green, true);
-                    Open(Address);
-                    return;
-                }
-                await Task.Delay(1250);
+                if (!File.Exists(Path.Combine(root, "compose.yaml")))
+                    throw new InvalidOperationException("Распакуйте весь архив Research Agent рядом с ResearchAgent.exe.");
+                ShowStatus("Подготовка Docker", yellow, false);
+                await Task.Run(() => {
+                    EnsureDocker();
+                    RunDocker(Compose("build"), 900, true);
+                });
             }
-            throw new InvalidOperationException("Контейнер запущен, но сервер не ответил. Проверьте журнал контейнера в Docker Desktop.");
+            else if (!File.Exists(LocalExecutable))
+                throw new InvalidOperationException("Сервер не найден. Распакуйте весь архив Research Agent.");
+
+            if (mode == ServerMode.Local || mode == ServerMode.Container)
+            {
+                previous = mode;
+                ShowStatus("Остановка сервера", yellow, false);
+                await StopActive();
+            }
+            starting = true;
+            await Launch(target);
+            busy = false;
+            ShowRunning(target);
+            if (reuseRunning || previous == ServerMode.None) Open(Address);
+            return;
         }
-        catch (Exception error) { ShowError(error); }
+        catch (Exception error) { message = error.Message; }
+
+        if (starting)
+        {
+            try
+            {
+                await StopActive();
+                if (previous == ServerMode.Local || previous == ServerMode.Container)
+                {
+                    await Launch(previous);
+                    message += "\nПредыдущий режим восстановлен.";
+                }
+            }
+            catch (Exception recovery) { message += "\n" + recovery.Message; }
+        }
+        var available = ModeOf(await Task.Run(() => RunningInstance()));
+        busy = false;
+        if (available != ServerMode.None) ShowRunning(available);
+        else ShowStatus("Требуется действие", red, false);
+        Notify(message);
     }
 
-    private async Task StopServer()
+    private string LocalExecutable { get { return Path.Combine(root, "runtime", "research-server", "research-server.exe"); } }
+
+    private bool LocalRunning() { return localProcess != null && !localProcess.HasExited; }
+
+    private void StartLocal()
     {
-        if (busy || !managed) return;
+        var info = new ProcessStartInfo(LocalExecutable, "--stop-on-stdin --data-dir data --materials-dir Materials") {
+            WorkingDirectory = root, UseShellExecute = false, CreateNoWindow = true,
+            RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8, StandardErrorEncoding = Encoding.UTF8
+        };
+        info.EnvironmentVariables["RESEARCH_AGENT_INSTANCE"] = project + "-local";
+        info.EnvironmentVariables.Remove("RESEARCH_AGENT_HOST_MATERIALS");
+        info.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8";
+        if (localProcess != null) localProcess.Dispose();
+        localProcess = Process.Start(info);
+        localProcess.BeginOutputReadLine();
+        localErrors = localProcess.StandardError.ReadToEndAsync();
+    }
+
+    private async Task Launch(ServerMode target)
+    {
+        if (await Task.Run(() => PortInUse()))
+            throw new InvalidOperationException("Порт 8765 не освободился. Повторите запуск после остановки другого сервера.");
+        mode = target;
+        ShowStatus("Запуск сервера", yellow, false);
+        if (target == ServerMode.Local) StartLocal();
+        else await Task.Run(() => RunDocker(Compose("up -d --no-build --pull never"), 90, true));
+
+        for (int attempt = 0; attempt < 30; attempt++)
+        {
+            if (ModeOf(await Task.Run(() => RunningInstance())) == target) return;
+            if (target == ServerMode.Local && !LocalRunning())
+                throw new InvalidOperationException("Локальный сервер завершился при запуске.\n" + ErrorTail(await localErrors));
+            await Task.Delay(1000);
+        }
+        throw new InvalidOperationException("Сервер не ответил после запуска.");
+    }
+
+    private async Task StopActive()
+    {
+        if (mode == ServerMode.Local && LocalRunning())
+        {
+            localProcess.StandardInput.Close();
+            if (!await Task.Run(() => localProcess.WaitForExit(45000)))
+                throw new InvalidOperationException("Локальный сервер ещё завершает работу. Повторите попытку позже.");
+        }
+        if (mode == ServerMode.Container)
+            await Task.Run(() => RunDocker(Compose("stop"), 60, true));
+        mode = ServerMode.None;
+    }
+
+    private async Task StopServer(bool leave)
+    {
+        if (busy) return;
+        operation++;
+        errorDetails.Available = false;
         busy = true;
         ShowStatus("Остановка сервера", yellow, false);
         try
         {
-            await Task.Run(() => RunDocker(Compose("stop"), 60, true));
-            managed = false;
+            await StopActive();
             busy = false;
+            if (leave) { ExitThread(); return; }
             ShowStatus("Остановлен", gray, false);
         }
         catch (Exception error) { ShowError(error); }
@@ -182,20 +294,15 @@ internal sealed class AgentTray : ApplicationContext
         return "compose --project-name " + project + " --file compose.yaml " + command;
     }
 
-    private bool ContainerRunning()
-    {
-        try { return RunDocker(Compose("ps --status running --quiet research-agent"), 5, true).Trim().Length > 0; }
-        catch (Win32Exception) { return false; }
-        catch (InvalidOperationException) { return false; }
-    }
-
     private void EnsureDocker()
     {
         try
         {
-            if (RunDocker("info --format {{.OSType}}", 8, false).Trim() == "linux") return;
+            string type = RunDocker("info --format {{.OSType}}", 8, false).Trim();
+            if (type == "linux") return;
+            if (type == "windows") throw new InvalidOperationException("Переключите Docker Desktop на Linux containers и повторите запуск.");
         }
-        catch (Win32Exception) { throw new InvalidOperationException("Установите Docker Desktop, затем выберите «Запустить сервер»."); }
+        catch (Win32Exception) { throw new InvalidOperationException("Для запуска в контейнере установите Docker Desktop."); }
         if (File.Exists(dockerDesktop))
         {
             using (Process.Start(new ProcessStartInfo(dockerDesktop) { UseShellExecute = true, WindowStyle = ProcessWindowStyle.Hidden })) { }
@@ -222,6 +329,7 @@ internal sealed class AgentTray : ApplicationContext
         info.EnvironmentVariables.Remove("DOCKER_CONTEXT");
         info.EnvironmentVariables.Remove("DOCKER_HOST");
         info.EnvironmentVariables["RESEARCH_AGENT_INSTANCE"] = project;
+        info.EnvironmentVariables["RESEARCH_AGENT_IMAGE"] = project + ":local";
         info.EnvironmentVariables["RESEARCH_AGENT_HOST_MATERIALS"] = Path.Combine(root, "Materials");
         using (var process = Process.Start(info))
         {
@@ -236,11 +344,16 @@ internal sealed class AgentTray : ApplicationContext
             Task.WaitAll(output, errors);
             if (process.ExitCode == 0) return output.Result;
             if (!required) return "";
-            string message = errors.Result.Trim();
-            string key = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
-            if (!String.IsNullOrEmpty(key)) message = message.Replace(key, "[скрыто]");
-            throw new InvalidOperationException("Ошибка Docker.\n" + message.Substring(Math.Max(0, message.Length - 750)));
+            throw new InvalidOperationException("Ошибка Docker.\n" + ErrorTail(errors.Result));
         }
+    }
+
+    private static string ErrorTail(string message)
+    {
+        string key = Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        if (!String.IsNullOrEmpty(key)) message = message.Replace(key, "[скрыто]");
+        message = message.Trim();
+        return message.Substring(Math.Max(0, message.Length - 750));
     }
 
     private static string RunningInstance()
@@ -278,12 +391,13 @@ internal sealed class AgentTray : ApplicationContext
 
     private void ShowStatus(string text, Icon icon, bool available)
     {
-        healthy = available;
         status.Text = text;
         tray.Text = "Research Agent · " + text;
         tray.Icon = icon;
-        start.Enabled = !busy && !available;
-        stop.Enabled = !busy && managed;
+        start.Enabled = !busy && mode == ServerMode.None;
+        stop.Enabled = !busy && (mode == ServerMode.Local || mode == ServerMode.Container);
+        restartContainer.Enabled = !busy && mode != ServerMode.Other && mode != ServerMode.Container;
+        restartLocal.Enabled = !busy && mode != ServerMode.Other && mode != ServerMode.Local;
         open.Enabled = available;
         exit.Enabled = !busy;
     }
@@ -311,8 +425,9 @@ internal sealed class AgentTray : ApplicationContext
 
     private void Notify(string message)
     {
+        lastError = message;
+        errorDetails.Available = true;
         tray.ShowBalloonTip(5000, "Research Agent", message, ToolTipIcon.Warning);
-        MessageBox.Show(message, "Research Agent", MessageBoxButtons.OK, MessageBoxIcon.Warning);
     }
 
     [DllImport("user32.dll")]
@@ -346,6 +461,7 @@ internal sealed class AgentTray : ApplicationContext
             tray.Visible = false;
             tray.Dispose();
             menu.Dispose();
+            if (localProcess != null) localProcess.Dispose();
             gray.Dispose(); yellow.Dispose(); green.Dispose(); red.Dispose();
         }
         base.Dispose(disposing);

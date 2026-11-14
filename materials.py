@@ -202,8 +202,12 @@ def extract_pdf(raw, checkpoint, *, full=False):
     if not raw.startswith(b"%PDF-") or not full and len(raw) > PDF_LIMIT:
         raise MaterialError("Источник не вернул PDF размером до 15 МБ.")
     env = {key: value for key, value in os.environ.items() if key.upper() != "OPENAI_API_KEY"}
+    command = [sys.executable]
+    if not getattr(sys, "frozen", False):
+        command.append(str(Path(__file__).resolve()))
+    command.append("extract-full" if full else "extract")
     process = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve()), "extract-full" if full else "extract"], stdin=subprocess.PIPE,
+        command, stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
         creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
@@ -963,12 +967,15 @@ def citation_location(data, anchor):
     return part["page"], part["text"], start, end
 
 
-if __name__ == "__main__" and sys.argv[1:] in (["extract"], ["extract-full"]):
+def extract_pdf_stream(*, full):
     try:
-        full = sys.argv[1] == "extract-full"
         result = _pdf_data(sys.stdin.buffer.read(-1 if full else PDF_LIMIT + 1), full=full)
     except ImportError:
         result = {"error": "Для извлечения текста установите pypdf: python -m pip install -r requirements.txt."}
     except Exception:
         result = {"error": "Не удалось прочитать структуру PDF. Проверьте файл."}
     sys.stdout.buffer.write(json.dumps(result, ensure_ascii=False).encode("utf-8"))
+
+
+if __name__ == "__main__" and sys.argv[1:] in (["extract"], ["extract-full"]):
+    extract_pdf_stream(full=sys.argv[1] == "extract-full")

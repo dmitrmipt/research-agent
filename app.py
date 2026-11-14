@@ -22,7 +22,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from manuscripts import render_tex_preview
 from materials import (PDF_LIMIT, PROFILE_VERSION, EXTRACTION_VERSION, RMP_REFERENCE_START, MaterialError, MaterialLibrary,
-                       abstract_from_parts, arxiv_id, citation_location, clean_text, extraction_signature, main_text_pages, profile_sections,
+                       abstract_from_parts, arxiv_id, citation_location, clean_text, extract_pdf_stream, extraction_signature, main_text_pages, profile_sections,
                        render_markdown_preview, saved_pages, split_sections)
 from publications import Http, Publications, ServiceError, metadata_title
 from research import (BIBLIOGRAPHY_MISSING, LEGACY_SEARCH_NOTES, bibliography, locate_citations,
@@ -939,11 +939,15 @@ class LocalServer(ThreadingHTTPServer):
 
 
 def main():
+    if sys.argv[1:] in (["extract"], ["extract-full"]):
+        extract_pdf_stream(full=sys.argv[1] == "extract-full")
+        return
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--bind", choices=("127.0.0.1", "0.0.0.0"), default="127.0.0.1")
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data")
     parser.add_argument("--materials-dir", type=Path)
+    parser.add_argument("--stop-on-stdin", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     # Bind before recovery: a second instance must not interrupt the first one's jobs.
     try:
@@ -955,18 +959,25 @@ def main():
             materials_dir = args.materials_dir
             if materials_dir is None:
                 materials_dir = ROOT / "Materials" if args.data_dir.resolve() == ROOT / "data" else args.data_dir / "Materials"
-            serve(server, args.data_dir, materials_dir)
+            serve(server, args.data_dir, materials_dir, args.stop_on_stdin)
     except AlreadyRunning as error:
         server.server_close()
         raise SystemExit(str(error)) from None
 
 
-def serve(server, data_dir, materials_dir):
+def serve(server, data_dir, materials_dir, stop_on_stdin=False):
     server.store = Store(data_dir, materials_dir)
     server.worker = Worker(server.store, os.environ.get("OPENAI_API_KEY", "").strip())
     server.worker.thread.start()
     print(f"Research Agent {VERSION}: http://127.0.0.1:{server.server_port}\nData: {data_dir}\n"
           f"Materials: {materials_dir}\nPress Ctrl+C to stop.", flush=True)
+    if stop_on_stdin:
+        def watch_launcher():
+            # A stop command or a closed pipe means the launcher released this process.
+            sys.stdin.buffer.read(1)
+            server.shutdown()
+
+        threading.Thread(target=watch_launcher, daemon=True, name="launcher-stop").start()
     try:
         server.serve_forever(poll_interval=.2)
     except KeyboardInterrupt:

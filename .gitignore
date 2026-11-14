@@ -10,3 +10,4 @@ __pycache__/
 !.env.example
 /ResearchAgent.exe
 /research-agent-image.tar.gz
+/runtime/

@@ -33,27 +33,32 @@ jobs:
       - run: python tests/browser_smoke.py --engine ${{ matrix.engine }}
   windows-launcher:
     runs-on: windows-latest
-    needs: container
     steps:
       - uses: actions/checkout@v4
-      - run: ./build-windows.ps1
-      - uses: actions/download-artifact@v4
+      - uses: actions/setup-python@v5
         with:
-          name: ResearchAgent-container-image
+          python-version: '3.13'
+      - run: python -m pip install -r requirements-windows.txt
+      - run: ./build-windows.ps1
+      - run: python tests/windows_bundle_smoke.py
       - uses: actions/upload-artifact@v4
         with:
           name: ResearchAgent-windows
           include-hidden-files: true
           path: |
             ResearchAgent.exe
-            research-agent-image.tar.gz
+            runtime/
             Dockerfile
             .dockerignore
             compose.yaml
             requirements.txt
             *.py
             static/
+            start.cmd
+            start.ps1
             README.md
+            CHANGELOG.md
+            screen.png
             LICENSE
   container:
     runs-on: ubuntu-latest
@@ -69,10 +74,5 @@ jobs:
           test -f data/research.sqlite3
           docker compose up -d --wait --wait-timeout 60
           curl -fsS "http://127.0.0.1:8765/api/jobs/$job" | jq -e '.status == "interrupted"'
-      - run: docker image save research-agent:local | gzip > research-agent-image.tar.gz
-      - uses: actions/upload-artifact@v4
-        with:
-          name: ResearchAgent-container-image
-          path: research-agent-image.tar.gz
       - if: always()
         run: docker compose down
