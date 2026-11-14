@@ -150,6 +150,9 @@ def run(channel=None, screenshots=None, engine="chromium"):
     fixture.setUp()
     try:
         with sync_playwright() as playwright:
+            # The full Chromium browser can open citation PDFs in its built-in viewer.
+            if engine == "chromium" and channel is None:
+                channel = "chromium"
             browser = getattr(playwright, engine).launch(channel=channel)
             page = browser.new_page(viewport={"width": 1440, "height": 1000})
             errors = []
@@ -297,7 +300,7 @@ def run(channel=None, screenshots=None, engine="chromium"):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--channel", help="Installed browser channel, e.g. msedge; defaults to Playwright Chromium")
+    parser.add_argument("--channel", help="Browser channel, e.g. msedge; Chromium uses its full browser by default")
     parser.add_argument("--engine", choices=("chromium", "firefox"), default="chromium")
     parser.add_argument("--screenshots", type=Path, help="Directory for design review screenshots")
     args = parser.parse_args()
